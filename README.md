@@ -7,9 +7,9 @@ closing-line value (CLV) and actual outcomes to recalibrate itself over time.
 ## Quick start (Google Colab)
 
 1. Open `WNBA_Prop_Predictor.ipynb` in Colab:
-   `https://colab.research.google.com/github/ianbjorgum35-creator/wnba/blob/<branch>/WNBA_Prop_Predictor.ipynb`
-   (replace `<branch>` with whichever branch has this notebook, e.g. `main`
-   once merged).
+   `https://colab.research.google.com/github/ianbjorgum35-creator/WNBA/blob/claude/wnba-update/WNBA_Prop_Predictor.ipynb`
+   (once this branch is merged, use `main` instead in that URL, and update
+   the `BRANCH` variable in the notebook's clone cell to match).
 2. Runtime > Run all.
 3. Use the form: pick player team / opponent team / prop type from
    dropdowns, type in the player's name, the line, the odds, the game total
