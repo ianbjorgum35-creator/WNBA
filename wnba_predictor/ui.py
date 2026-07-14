@@ -164,16 +164,28 @@ class PredictorUI:
             print("Done. Review/edit any fields above, then click Run Prediction.")
 
     def _fetch_player_data(self):
+        gamelog_res = None
         player_res = data_sources.get_player_id(self.w_player_name.value)
-        if not player_res.success:
-            print(f"  Player lookup failed: {player_res.message}")
-            return
-        player_id = player_res.data
+        if player_res.success:
+            gamelog_res = data_sources.get_player_gamelog(player_res.data)
+            if not gamelog_res.success:
+                print(f"  stats.wnba.com game log fetch failed: {gamelog_res.message}")
+        else:
+            print(f"  stats.wnba.com player lookup failed: {player_res.message}")
 
-        gamelog_res = data_sources.get_player_gamelog(player_id)
-        if not gamelog_res.success:
-            print(f"  Game log fetch failed: {gamelog_res.message}")
-            return
+        if gamelog_res is None or not gamelog_res.success:
+            print("  Trying ESPN as a fallback source (unverified against live traffic -- "
+                  "may not match this endpoint's real shape)...")
+            espn_team = TEAM_ABBR[self.w_player_team.value]
+            espn_id_res = data_sources.get_espn_player_id(self.w_player_name.value, espn_team)
+            if not espn_id_res.success:
+                print(f"  ESPN player lookup also failed: {espn_id_res.message}")
+                return
+            gamelog_res = data_sources.get_espn_player_gamelog(espn_id_res.data)
+            if not gamelog_res.success:
+                print(f"  ESPN game log fetch also failed: {gamelog_res.message}")
+                return
+            print("  Loaded game log from ESPN fallback.")
 
         df = stats_engine.normalize_gamelog(gamelog_res.data)
         self._player_gamelog = df

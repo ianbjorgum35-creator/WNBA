@@ -74,12 +74,13 @@ learning across sessions.
 
 ## Data sources and their limits
 
-Auto-fetch hits two unofficial, reverse-engineered public endpoints:
+Auto-fetch hits unofficial, reverse-engineered public endpoints:
 
 - `stats.wnba.com` (mirrors the well-known stats.nba.com API shape with
   `LeagueID=10`) for player game logs and team pace/defense ranks.
 - ESPN's hidden site API for injuries, rosters, and schedules (rest days /
-  back-to-backs).
+  back-to-backs), and as a **fallback player game log source** if
+  `stats.wnba.com` fails.
 
 These were not network-testable from the build sandbox (its egress policy
 blocked both hosts), so **test the Auto-Fetch button first** when you open
@@ -88,6 +89,16 @@ exactly why every auto-fetched field is a plain editable box: if a fetch
 fails, type the number in yourself and keep going. Defense-vs-position
 (DvP) rank in particular has no single reliable free endpoint; treat
 opponent defensive rank as a proxy for it unless you fill DvP in yourself.
+
+**If `stats.wnba.com` calls hang and then time out:** this is a known
+failure mode for NBA/WNBA-family "stats" APIs -- they frequently block or
+silently throttle requests from cloud/datacenter IPs, which is exactly what
+Colab runs on (a residential/local connection often doesn't hit this at
+all). `data_sources.py` already does a cookie warm-up against wnba.com and
+retries once before giving up, and auto-fetch then falls back to pulling
+the game log from ESPN instead. If both sources fail, that's expected
+sometimes -- just fill in the stat fields by hand and keep going; nothing
+else in the notebook depends on the auto-fetch succeeding.
 
 Injury/lineup confirmation is likewise best-effort -- there's no clean
 structured free feed for this, so the **Lineup Confirmed?** checkbox is the

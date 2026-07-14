@@ -44,6 +44,30 @@ DEFAULT_HEADERS = {
 REQUEST_TIMEOUT = 12
 CACHE_TTL_SECONDS = 60 * 30  # 30 minutes
 
+# stats.wnba.com (and the stats.nba.com infrastructure it mirrors) is known to
+# hang or silently block requests from cloud/datacenter IPs -- which is what
+# Colab runs on -- rather than returning a clean error. Two mitigations below:
+# a cookie warm-up hit against the public wnba.com site (some bot filters key
+# off having a same-origin cookie) and a couple of retries so a one-off
+# network blip doesn't look identical to a hard block.
+STATS_RETRIES = 2
+STATS_RETRY_BACKOFF_SECONDS = 2.0
+_wnba_session: Optional["requests.Session"] = None
+
+
+def _get_wnba_session() -> "requests.Session":
+    global _wnba_session
+    if _wnba_session is not None:
+        return _wnba_session
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    try:
+        session.get("https://www.wnba.com/", timeout=8)
+    except requests.exceptions.RequestException:
+        pass  # warm-up is best-effort; proceed with the session regardless
+    _wnba_session = session
+    return session
+
 
 @dataclass
 class FetchResult:
@@ -93,24 +117,37 @@ def _cache_set(key: str, value: Any) -> None:
 
 
 def _get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None,
-               cache_key: Optional[str] = None) -> FetchResult:
+               cache_key: Optional[str] = None, session: Optional["requests.Session"] = None,
+               retries: int = 1, timeout: int = REQUEST_TIMEOUT) -> FetchResult:
     if cache_key is not None:
         cached = _cache_get(cache_key)
         if cached is not None:
             return FetchResult.ok(cached, message="from cache")
-    try:
-        resp = requests.get(
-            url, params=params, headers=headers or DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except requests.exceptions.RequestException as exc:
-        return FetchResult.fail(f"request failed: {exc}")
-    except ValueError as exc:
-        return FetchResult.fail(f"bad JSON response: {exc}")
-    if cache_key is not None:
-        _cache_set(cache_key, payload)
-    return FetchResult.ok(payload)
+
+    getter = session.get if session is not None else requests.get
+    last_error = "request failed"
+    for attempt in range(retries):
+        try:
+            resp = getter(url, params=params, headers=headers or DEFAULT_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+        except requests.exceptions.Timeout as exc:
+            last_error = f"timed out (likely blocked/throttled for this IP): {exc}"
+            if attempt < retries - 1:
+                time.sleep(STATS_RETRY_BACKOFF_SECONDS)
+            continue
+        except requests.exceptions.RequestException as exc:
+            last_error = f"request failed: {exc}"
+            if attempt < retries - 1:
+                time.sleep(STATS_RETRY_BACKOFF_SECONDS)
+            continue
+        except ValueError as exc:
+            return FetchResult.fail(f"bad JSON response: {exc}")
+        else:
+            if cache_key is not None:
+                _cache_set(cache_key, payload)
+            return FetchResult.ok(payload)
+    return FetchResult.fail(last_error)
 
 
 # --------------------------------------------------------------------------
@@ -118,7 +155,10 @@ def _get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] =
 # --------------------------------------------------------------------------
 
 def _stats_endpoint(endpoint: str, params: dict, cache_key: str) -> FetchResult:
-    return _get_json(f"{WNBA_STATS_BASE}/{endpoint}", params=params, cache_key=cache_key)
+    return _get_json(
+        f"{WNBA_STATS_BASE}/{endpoint}", params=params, cache_key=cache_key,
+        session=_get_wnba_session(), retries=STATS_RETRIES,
+    )
 
 
 def _rows_from_resultsets(payload: dict, result_name: Optional[str] = None):
@@ -275,6 +315,94 @@ def get_espn_team_schedule(espn_team_abbr: str, season: Optional[str] = None) ->
 def get_espn_injuries() -> FetchResult:
     """League-wide injury report. ESPN's injuries payload is nested per team."""
     return _get_json(f"{ESPN_SITE_BASE}/injuries", cache_key="espn_injuries")
+
+
+ESPN_COMMON_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/wnba"
+
+# Maps the stat label strings ESPN's gamelog API uses onto our normalized
+# column names. ESPN doesn't document this endpoint, so this list covers the
+# label spellings seen in the equivalent NBA gamelog payload (WNBA is served
+# by the same platform); unmatched labels are simply dropped rather than
+# raising, since this fallback must degrade safely if ESPN changes the shape.
+_ESPN_STAT_LABEL_MAP = {
+    "MIN": "MIN", "PTS": "PTS", "REB": "REB", "AST": "AST",
+    "STL": "STL", "BLK": "BLK", "TO": "TOV", "TOV": "TOV",
+    "3PM": "FG3M", "3PT": "FG3M",
+}
+
+
+def get_espn_player_id(player_name: str, espn_team_abbr: str) -> FetchResult:
+    """Resolve an athlete ID from a team roster by (fuzzy) name match."""
+    roster_res = get_espn_team_roster(espn_team_abbr)
+    if not roster_res.success:
+        return roster_res
+    try:
+        athletes = roster_res.data.get("athletes", [])
+        # ESPN sometimes groups the roster by position; flatten if so.
+        flat = []
+        for a in athletes:
+            if "items" in a:
+                flat.extend(a["items"])
+            else:
+                flat.append(a)
+        name_lower = player_name.strip().lower()
+        for a in flat:
+            display = (a.get("displayName") or a.get("fullName") or "").strip().lower()
+            if display == name_lower:
+                return FetchResult.ok(a.get("id"))
+        for a in flat:
+            display = (a.get("displayName") or a.get("fullName") or "").strip().lower()
+            if name_lower in display or display in name_lower:
+                return FetchResult.ok(a.get("id"), message=f"partial match: {display}")
+    except (AttributeError, TypeError, KeyError) as exc:
+        return FetchResult.fail(f"unexpected roster shape: {exc}")
+    return FetchResult.fail(f"no player found matching '{player_name}' on {espn_team_abbr} roster")
+
+
+def get_espn_player_gamelog(athlete_id) -> FetchResult:
+    """Fallback player game log via ESPN's (undocumented) gamelog endpoint,
+    used when stats.wnba.com is unreachable. Best-effort: returns
+    FetchResult.fail rather than raising if the response doesn't match the
+    expected shape, so a schema change here degrades safely to manual entry.
+    """
+    res = _get_json(
+        f"{ESPN_COMMON_BASE}/athletes/{athlete_id}/gamelog",
+        cache_key=f"espn_gamelog_{athlete_id}",
+    )
+    if not res.success:
+        return res
+
+    try:
+        payload = res.data
+        events_meta = payload.get("events", {})
+        rows = []
+        for season_type in payload.get("seasonTypes", []):
+            for category in season_type.get("categories", []):
+                labels = category.get("labels") or category.get("names") or []
+                col_index = {}
+                for i, label in enumerate(labels):
+                    mapped = _ESPN_STAT_LABEL_MAP.get(str(label).upper())
+                    if mapped:
+                        col_index[mapped] = i
+                for event in category.get("events", []):
+                    event_id = event.get("eventId") or event.get("id")
+                    stats = event.get("stats", [])
+                    meta = events_meta.get(str(event_id), {}) if isinstance(events_meta, dict) else {}
+                    opponent = (meta.get("opponent") or {}).get("abbreviation", "")
+                    at_vs = meta.get("atVs", "vs")
+                    row = {
+                        "GAME_DATE": meta.get("gameDate"),
+                        "MATCHUP": f"{at_vs} {opponent}".strip(),
+                    }
+                    for col, idx in col_index.items():
+                        if idx < len(stats):
+                            row[col] = stats[idx]
+                    rows.append(row)
+        if not rows:
+            return FetchResult.fail("ESPN gamelog returned no parsable rows")
+        return FetchResult.ok(rows)
+    except (AttributeError, TypeError, KeyError, IndexError) as exc:
+        return FetchResult.fail(f"unexpected ESPN gamelog shape: {exc}")
 
 
 def get_espn_team_roster(espn_team_abbr: str) -> FetchResult:
