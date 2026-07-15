@@ -68,11 +68,14 @@ CACHE_TTL_SECONDS = 60 * 30  # 30 minutes
 
 # stats.wnba.com (and the stats.nba.com infrastructure it mirrors) is known to
 # hang or silently block requests from cloud/datacenter IPs -- which is what
-# Colab runs on -- rather than returning a clean error. Two mitigations below:
-# a cookie warm-up hit against the public wnba.com site (some bot filters key
-# off having a same-origin cookie) and a couple of retries so a one-off
-# network blip doesn't look identical to a hard block.
+# Colab runs on -- rather than returning a clean error, and this has now been
+# confirmed live (consistent ~12s read-timeouts from a Colab session). A
+# cookie warm-up and one retry are kept in case it's ever just a transient
+# blip elsewhere, but the per-attempt timeout is shorter than the general
+# REQUEST_TIMEOUT so a hard block fails in ~12s total instead of ~28s before
+# falling through to the ESPN fallback.
 STATS_RETRIES = 2
+STATS_TIMEOUT = 6
 STATS_RETRY_BACKOFF_SECONDS = 2.0
 _wnba_session: Optional["requests.Session"] = None
 
@@ -179,7 +182,7 @@ def _get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] =
 def _stats_endpoint(endpoint: str, params: dict, cache_key: str) -> FetchResult:
     return _get_json(
         f"{WNBA_STATS_BASE}/{endpoint}", params=params, cache_key=cache_key,
-        session=_get_wnba_session(), retries=STATS_RETRIES,
+        session=_get_wnba_session(), retries=STATS_RETRIES, timeout=STATS_TIMEOUT,
     )
 
 
@@ -340,6 +343,70 @@ def get_espn_team_schedule(espn_team_abbr: str, season: Optional[str] = None) ->
 def get_espn_injuries() -> FetchResult:
     """League-wide injury report. ESPN's injuries payload is nested per team."""
     return _espn_endpoint(f"{ESPN_SITE_BASE}/injuries", None, cache_key="espn_injuries")
+
+
+def get_espn_standings() -> FetchResult:
+    return _espn_endpoint(f"{ESPN_SITE_BASE}/standings", None, cache_key="espn_standings")
+
+
+def get_espn_team_ranks_fallback() -> FetchResult:
+    """Approximates pace/defense ranks from ESPN standings for when
+    stats.wnba.com is unreachable. Defense rank is a genuine points-allowed
+    rank; "pace" here is only a rough proxy (combined points per game,
+    offense + defense), since ESPN's standings don't expose true
+    possession-based pace -- it's directionally useful but not the same
+    number stats.wnba.com would give you, so it's flagged as a proxy in the
+    returned dict rather than presented as equivalent.
+    """
+    res = get_espn_standings()
+    if not res.success:
+        return res
+    try:
+        entries = []
+        for child in res.data.get("children", []):
+            entries.extend((child.get("standings") or {}).get("entries", []))
+        if not entries:
+            entries = (res.data.get("standings") or {}).get("entries", [])
+
+        team_rows = []
+        for e in entries:
+            team = e.get("team", {})
+            stat_map = {s.get("name"): s.get("value") for s in e.get("stats", []) if s.get("name")}
+            games = stat_map.get("gamesPlayed") or None
+            points_for = stat_map.get("pointsFor") or stat_map.get("avgPointsFor")
+            points_against = stat_map.get("pointsAgainst") or stat_map.get("avgPointsAgainst")
+            if points_for is None or points_against is None:
+                continue
+            # normalize to per-game if these look like season totals rather than averages
+            if games and points_for > 200:
+                points_for, points_against = points_for / games, points_against / games
+            team_rows.append({
+                "team_name": team.get("displayName"),
+                "points_for_pg": points_for,
+                "points_against_pg": points_against,
+            })
+
+        if not team_rows:
+            return FetchResult.fail("no usable points-for/against found in ESPN standings")
+
+        by_def = sorted(team_rows, key=lambda t: t["points_against_pg"])  # fewest allowed = rank 1
+        def_rank = {t["team_name"]: i + 1 for i, t in enumerate(by_def)}
+        by_pace = sorted(team_rows, key=lambda t: -(t["points_for_pg"] + t["points_against_pg"]))
+        pace_rank = {t["team_name"]: i + 1 for i, t in enumerate(by_pace)}
+
+        ranks = {
+            t["team_name"]: {
+                "pace_rank": pace_rank[t["team_name"]],
+                "def_rating_rank": def_rank[t["team_name"]],
+                "off_rating_rank": None,
+                "net_rating_rank": None,
+                "source": "espn_standings_proxy",
+            }
+            for t in team_rows
+        }
+        return FetchResult.ok(ranks)
+    except (AttributeError, TypeError, KeyError, ZeroDivisionError) as exc:
+        return FetchResult.fail(f"unexpected ESPN standings shape: {exc}")
 
 
 def get_espn_team_schedule_parsed(espn_team_abbr: str, season: Optional[str] = None) -> FetchResult:
@@ -598,17 +665,21 @@ def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[st
     _check("stats_wnba_reachability (team ranks)", get_team_ranks)
     _check("espn_reachability (scoreboard)", get_espn_scoreboard)
     _check("espn_teams", get_espn_teams)
+    _check("espn_team_ranks_fallback (standings)", get_espn_team_ranks_fallback)
 
     espn_abbr = None
     if player_team_name:
         espn_abbr = _check("espn_resolve_team_abbr", lambda: resolve_espn_team_abbr(player_team_name))
         if espn_abbr:
             _check("espn_team_roster", lambda: get_espn_team_roster(espn_abbr))
+            _check("espn_team_schedule_parsed", lambda: get_espn_team_schedule_parsed(espn_abbr))
 
     if player_name:
         _check("stats_wnba_player_id", lambda: get_player_id(player_name))
         if espn_abbr:
-            _check("espn_player_id", lambda: get_espn_player_id(player_name, espn_abbr))
+            espn_player_id = _check("espn_player_id", lambda: get_espn_player_id(player_name, espn_abbr))
+            if espn_player_id:
+                _check("espn_player_gamelog", lambda: get_espn_player_gamelog(espn_player_id))
 
     for name, entry in report.items():
         status = "OK" if entry["ok"] else "FAILED"

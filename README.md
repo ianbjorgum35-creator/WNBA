@@ -81,44 +81,37 @@ learning across sessions.
 
 ## Data sources and their limits
 
-Auto-fetch hits unofficial, reverse-engineered public endpoints:
+**Confirmed (via a live diagnostics run from Colab): `stats.wnba.com` is
+blocked outright** -- every call to it times out after several seconds,
+consistent with it blackholing requests from cloud/datacenter IPs. This
+isn't a bug to chase further; the app is built to route around it
+entirely via ESPN:
 
-- `stats.wnba.com` (mirrors the well-known stats.nba.com API shape with
-  `LeagueID=10`) for player game logs and team pace/defense ranks.
-- ESPN's hidden site API for injuries, rosters, schedules, and team lookups
-  -- and as the **fallback player game log source** if `stats.wnba.com`
-  fails. Home/away, rest days, and back-to-back status are now derived
-  automatically from each team's ESPN schedule (matched against the
-  opponent you selected), not asked for manually.
+- ESPN's hidden site API is confirmed reachable and is the primary source
+  in practice: team/player lookups, rosters, schedules (home/away, rest
+  days, back-to-back -- derived automatically, not asked for manually),
+  player game logs, and standings-based pace/defense ranks.
+- `stats.wnba.com` (mirrors the stats.nba.com API shape with `LeagueID=10`)
+  is tried first for player game logs and team pace/defense ranks, on the
+  chance it's reachable from your environment, but is not required --
+  everything falls through to the ESPN path above when it isn't.
 
-Neither host was network-testable from the build sandbox (its egress
-policy blocked both), so **run the diagnostics cell/button first** when you
-open this in Colab -- it hits every endpoint independently and reports
-exactly which one is failing and why (timeout vs. HTTP error vs. an
-unexpected response shape) instead of a single opaque "failed" message.
-That's also exactly why every auto-fetched field stays a plain editable
-box: if a fetch fails, type the number in yourself and keep going rather
-than being blocked.
+Since neither host was network-testable from the build sandbox itself,
+**run the diagnostics cell/button** any time something isn't populating --
+it hits every endpoint independently and reports exactly which one is
+failing and why (timeout vs. HTTP error vs. an unexpected response shape).
+Watch the `espn_*` lines specifically, since those are the paths that
+actually matter now. That's also why every auto-fetched field stays a
+plain editable box regardless: if a fetch ever fails, type the number in
+yourself and keep going rather than being blocked.
 
-Known gaps where there's currently no fallback if `stats.wnba.com` is
-unreachable:
-- **Opponent pace rank / defense rank** -- these come only from
-  `stats.wnba.com`'s advanced team stats; ESPN doesn't expose an equivalent
-  metric through a simple endpoint. If diagnostics show `stats.wnba.com` is
-  blocked, fill these in by hand for now.
-- **Defense-vs-position (DvP) rank** has no single reliable free endpoint
-  at all, auto-fetch or otherwise; treat opponent defensive rank as a
-  proxy for it, or fill it in yourself.
-
-**If `stats.wnba.com` calls hang and then time out:** this is a known
-failure mode for NBA/WNBA-family "stats" APIs -- they frequently block or
-silently throttle requests from cloud/datacenter IPs, which is exactly what
-Colab runs on (a residential/local connection often doesn't hit this at
-all). `data_sources.py` does a cookie warm-up against wnba.com and retries
-before giving up, and auto-fetch falls back to ESPN for player stats. If
-you run diagnostics and ESPN also fails, share that output -- it tells us
-exactly which endpoint/shape assumption needs fixing rather than leaving
-it a mystery.
+Remaining known gap:
+- **Defense-vs-position (DvP) rank** has no reliable free endpoint at all,
+  auto-fetch or otherwise; treat opponent defensive rank as a proxy for it,
+  or fill it in yourself.
+- The ESPN standings-based pace rank is a **proxy** (combined scoring per
+  game), not true possession-based pace like `stats.wnba.com` would give
+  you -- directionally useful, not numerically identical.
 
 Injury/lineup confirmation is likewise best-effort -- there's no clean
 structured free feed for this, so the **Lineup Confirmed?** checkbox is the

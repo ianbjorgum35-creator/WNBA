@@ -322,3 +322,64 @@ def test_game_context_flags_back_to_back(monkeypatch):
     )
     result = data_sources.game_context("IND", "CHI")
     assert result.data["is_b2b"] is True
+
+
+def _fake_standings_payload():
+    def entry(name, points_for, points_against, games_played):
+        return {
+            "team": {"displayName": name},
+            "stats": [
+                {"name": "pointsFor", "value": points_for},
+                {"name": "pointsAgainst", "value": points_against},
+                {"name": "gamesPlayed", "value": games_played},
+            ],
+        }
+
+    return {
+        "children": [{
+            "standings": {
+                "entries": [
+                    entry("Indiana Fever", 1800, 1700, 20),   # 90.0 for / 85.0 against
+                    entry("Chicago Sky", 1600, 1750, 20),     # 80.0 for / 87.5 against
+                    entry("New York Liberty", 1900, 1600, 20),  # 95.0 for / 80.0 against
+                ]
+            }
+        }]
+    }
+
+
+def test_get_espn_team_ranks_fallback_parses_and_ranks(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_standings",
+        lambda: data_sources.FetchResult.ok(_fake_standings_payload()),
+    )
+    result = data_sources.get_espn_team_ranks_fallback()
+    assert result.success is True
+    ranks = result.data
+    # New York allows fewest points (80.0) -> best defense -> rank 1
+    assert ranks["New York Liberty"]["def_rating_rank"] == 1
+    # Indiana allows the most (85.0) among these three -> worse than NY, better than Chicago
+    assert ranks["Indiana Fever"]["def_rating_rank"] == 2
+    assert ranks["Chicago Sky"]["def_rating_rank"] == 3
+    for team_ranks in ranks.values():
+        assert team_ranks["source"] == "espn_standings_proxy"
+        assert team_ranks["pace_rank"] is not None
+
+
+def test_get_espn_team_ranks_fallback_fails_soft_on_unexpected_shape(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_standings",
+        lambda: data_sources.FetchResult.ok({"nope": True}),
+    )
+    result = data_sources.get_espn_team_ranks_fallback()
+    assert result.success is False
+
+
+def test_get_espn_team_ranks_fallback_propagates_network_failure(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_standings",
+        lambda: data_sources.FetchResult.fail("timed out"),
+    )
+    result = data_sources.get_espn_team_ranks_fallback()
+    assert result.success is False
+    assert "timed out" in result.message
