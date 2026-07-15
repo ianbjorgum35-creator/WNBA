@@ -6,6 +6,7 @@ could not be verified against live traffic in the build sandbox).
 
 import os
 import sys
+from datetime import date, timedelta
 
 import pytest
 import requests
@@ -147,3 +148,177 @@ def test_espn_player_gamelog_fails_soft_on_unexpected_shape(monkeypatch):
     )
     result = data_sources.get_espn_player_gamelog("999")
     assert result.success is False
+
+
+def _fake_espn_teams_payload():
+    return {
+        "sports": [{
+            "leagues": [{
+                "teams": [
+                    {"team": {"id": "1", "abbreviation": "IND", "displayName": "Indiana Fever"}},
+                    {"team": {"id": "2", "abbreviation": "CONN", "displayName": "Connecticut Sun"}},
+                ]
+            }]
+        }]
+    }
+
+
+def test_get_espn_teams_parses_expected_shape(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_get_json",
+        lambda *a, **k: data_sources.FetchResult.ok(_fake_espn_teams_payload()),
+    )
+    result = data_sources.get_espn_teams()
+    assert result.success is True
+    assert len(result.data) == 2
+    assert result.data[0]["abbreviation"] == "IND"
+
+
+def test_get_espn_teams_fails_soft_on_unexpected_shape(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_get_json",
+        lambda *a, **k: data_sources.FetchResult.ok({"nope": True}),
+    )
+    result = data_sources.get_espn_teams()
+    assert result.success is False
+
+
+def test_resolve_espn_team_abbr_finds_mismatched_abbreviation(monkeypatch):
+    # This is exactly the case the resolver exists for: our config abbreviates
+    # Connecticut as "CON", but ESPN's own abbreviation for it is "CONN".
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.ok([
+            {"displayName": "Indiana Fever", "abbreviation": "IND"},
+            {"displayName": "Connecticut Sun", "abbreviation": "CONN"},
+        ]),
+    )
+    result = data_sources.resolve_espn_team_abbr("Connecticut Sun")
+    assert result.success is True
+    assert result.data == "CONN"
+
+
+def test_resolve_espn_team_abbr_no_match(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.ok([{"displayName": "Indiana Fever", "abbreviation": "IND"}]),
+    )
+    result = data_sources.resolve_espn_team_abbr("Nonexistent Team")
+    assert result.success is False
+
+
+def test_diagnostics_reports_per_check_status(monkeypatch):
+    monkeypatch.setattr(data_sources, "get_team_ranks", lambda: data_sources.FetchResult.ok({"x": 1}))
+    monkeypatch.setattr(data_sources, "get_espn_scoreboard", lambda: data_sources.FetchResult.fail("boom"))
+    monkeypatch.setattr(data_sources, "get_espn_teams", lambda: data_sources.FetchResult.ok([]))
+    monkeypatch.setattr(data_sources, "resolve_espn_team_abbr", lambda name: data_sources.FetchResult.ok("IND"))
+    monkeypatch.setattr(data_sources, "get_espn_team_roster", lambda abbr: data_sources.FetchResult.ok({}))
+    monkeypatch.setattr(data_sources, "get_player_id", lambda name: data_sources.FetchResult.fail("not found"))
+    monkeypatch.setattr(data_sources, "get_espn_player_id", lambda name, abbr: data_sources.FetchResult.ok("123"))
+
+    report = data_sources.diagnostics(player_name="Test Player", player_team_name="Indiana Fever")
+
+    assert report["stats_wnba_reachability (team ranks)"]["ok"] is True
+    assert report["espn_reachability (scoreboard)"]["ok"] is False
+    assert report["espn_resolve_team_abbr"]["ok"] is True
+    assert report["espn_team_roster"]["ok"] is True
+    assert report["stats_wnba_player_id"]["ok"] is False
+    assert report["espn_player_id"]["ok"] is True
+
+
+def _fake_event(game_date, own_abbr, opp_abbr, is_home, completed):
+    return {
+        "date": f"{game_date.isoformat()}T23:00Z",
+        "competitions": [{
+            "date": f"{game_date.isoformat()}T23:00Z",
+            "competitors": [
+                {"team": {"abbreviation": own_abbr}, "homeAway": "home" if is_home else "away"},
+                {"team": {"abbreviation": opp_abbr}, "homeAway": "away" if is_home else "home"},
+            ],
+            "status": {"type": {"completed": completed}},
+        }],
+    }
+
+
+def test_get_espn_team_schedule_parsed_parses_expected_shape(monkeypatch):
+    d1, d2 = date(2026, 6, 1), date(2026, 6, 3)
+    fake_payload = {"events": [
+        _fake_event(d1, "IND", "CHI", True, True),
+        _fake_event(d2, "IND", "NYL", False, True),
+    ]}
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule",
+        lambda abbr, season=None: data_sources.FetchResult.ok(fake_payload),
+    )
+    result = data_sources.get_espn_team_schedule_parsed("IND")
+    assert result.success is True
+    assert len(result.data) == 2
+    assert result.data[0]["date"] == d1
+    assert result.data[0]["is_home"] is True
+    assert result.data[0]["opponent_abbr"] == "CHI"
+    assert result.data[1]["opponent_abbr"] == "NYL"
+
+
+def test_get_espn_team_schedule_parsed_fails_soft_on_unexpected_shape(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule",
+        lambda abbr, season=None: data_sources.FetchResult.ok({"nope": True}),
+    )
+    result = data_sources.get_espn_team_schedule_parsed("IND")
+    assert result.success is False
+
+
+def test_find_scheduled_game_prefers_upcoming():
+    today = date.today()
+    games = [
+        {"date": today - timedelta(days=10), "opponent_abbr": "CHI", "is_home": True, "completed": True},
+        {"date": today + timedelta(days=5), "opponent_abbr": "CHI", "is_home": False, "completed": False},
+        {"date": today + timedelta(days=2), "opponent_abbr": "NYL", "is_home": True, "completed": False},
+    ]
+    result = data_sources.find_scheduled_game(games, "CHI")
+    assert result["date"] == today + timedelta(days=5)
+
+
+def test_find_scheduled_game_falls_back_to_most_recent_past():
+    today = date.today()
+    games = [
+        {"date": today - timedelta(days=20), "opponent_abbr": "CHI", "is_home": True, "completed": True},
+        {"date": today - timedelta(days=5), "opponent_abbr": "CHI", "is_home": False, "completed": True},
+    ]
+    result = data_sources.find_scheduled_game(games, "CHI")
+    assert result["date"] == today - timedelta(days=5)
+
+
+def test_find_scheduled_game_no_match_returns_none():
+    assert data_sources.find_scheduled_game([{"date": date.today(), "opponent_abbr": "NYL"}], "CHI") is None
+
+
+def test_game_context_computes_rest_days_and_home_away(monkeypatch):
+    today = date.today()
+    games = [
+        {"date": today - timedelta(days=3), "opponent_abbr": "NYL", "is_home": True, "completed": True},
+        {"date": today + timedelta(days=1), "opponent_abbr": "CHI", "is_home": False, "completed": False},
+    ]
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.ok(games),
+    )
+    result = data_sources.game_context("IND", "CHI")
+    assert result.success is True
+    assert result.data["is_home"] is False
+    assert result.data["rest_days"] == 3  # 1 day before target minus the prior game date, exclusive
+    assert result.data["is_b2b"] is False
+
+
+def test_game_context_flags_back_to_back(monkeypatch):
+    today = date.today()
+    games = [
+        {"date": today, "opponent_abbr": "NYL", "is_home": True, "completed": True},
+        {"date": today + timedelta(days=1), "opponent_abbr": "CHI", "is_home": False, "completed": False},
+    ]
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.ok(games),
+    )
+    result = data_sources.game_context("IND", "CHI")
+    assert result.data["is_b2b"] is True

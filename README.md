@@ -10,11 +10,18 @@ closing-line value (CLV) and actual outcomes to recalibrate itself over time.
    `https://colab.research.google.com/github/ianbjorgum35-creator/WNBA/blob/claude/wnba-update/WNBA_Prop_Predictor.ipynb`
    (once this branch is merged, use `main` instead in that URL, and update
    the `BRANCH` variable in the notebook's clone cell to match).
-2. Runtime > Run all.
+2. Runtime > Run all. The "Check that the live data sources are actually
+   reachable" cell runs a diagnostic against every data source and prints
+   which ones are working -- if `stats.wnba.com` and/or ESPN are blocked in
+   your environment, you'll see it here before you even open the form.
 3. Use the form: pick player team / opponent team / prop type from
    dropdowns, type in the player's name, the line, the odds, the game total
-   and spread.
-4. Click **Auto-Fetch Data**, then **Run Prediction**.
+   and spread. Those (plus prop type/line/odds) are the only fields meant to
+   be manual -- everything else (stats, ranks, home/away, rest days) is
+   supposed to auto-fetch.
+4. Click **Auto-Fetch Data**, then **Run Prediction**. If some fields don't
+   populate, click **Run Diagnostics** to see exactly which data source
+   failed and why, then fill those specific fields in by hand.
 5. Click **Log This Prediction** to save it for the learning loop. After the
    game, come back and record the actual result (and closing odds, if you
    have them) so the model can learn from it.
@@ -78,27 +85,40 @@ Auto-fetch hits unofficial, reverse-engineered public endpoints:
 
 - `stats.wnba.com` (mirrors the well-known stats.nba.com API shape with
   `LeagueID=10`) for player game logs and team pace/defense ranks.
-- ESPN's hidden site API for injuries, rosters, and schedules (rest days /
-  back-to-backs), and as a **fallback player game log source** if
-  `stats.wnba.com` fails.
+- ESPN's hidden site API for injuries, rosters, schedules, and team lookups
+  -- and as the **fallback player game log source** if `stats.wnba.com`
+  fails. Home/away, rest days, and back-to-back status are now derived
+  automatically from each team's ESPN schedule (matched against the
+  opponent you selected), not asked for manually.
 
-These were not network-testable from the build sandbox (its egress policy
-blocked both hosts), so **test the Auto-Fetch button first** when you open
-this in Colab. They can change shape or rate-limit without notice. That's
-exactly why every auto-fetched field is a plain editable box: if a fetch
-fails, type the number in yourself and keep going. Defense-vs-position
-(DvP) rank in particular has no single reliable free endpoint; treat
-opponent defensive rank as a proxy for it unless you fill DvP in yourself.
+Neither host was network-testable from the build sandbox (its egress
+policy blocked both), so **run the diagnostics cell/button first** when you
+open this in Colab -- it hits every endpoint independently and reports
+exactly which one is failing and why (timeout vs. HTTP error vs. an
+unexpected response shape) instead of a single opaque "failed" message.
+That's also exactly why every auto-fetched field stays a plain editable
+box: if a fetch fails, type the number in yourself and keep going rather
+than being blocked.
+
+Known gaps where there's currently no fallback if `stats.wnba.com` is
+unreachable:
+- **Opponent pace rank / defense rank** -- these come only from
+  `stats.wnba.com`'s advanced team stats; ESPN doesn't expose an equivalent
+  metric through a simple endpoint. If diagnostics show `stats.wnba.com` is
+  blocked, fill these in by hand for now.
+- **Defense-vs-position (DvP) rank** has no single reliable free endpoint
+  at all, auto-fetch or otherwise; treat opponent defensive rank as a
+  proxy for it, or fill it in yourself.
 
 **If `stats.wnba.com` calls hang and then time out:** this is a known
 failure mode for NBA/WNBA-family "stats" APIs -- they frequently block or
 silently throttle requests from cloud/datacenter IPs, which is exactly what
 Colab runs on (a residential/local connection often doesn't hit this at
-all). `data_sources.py` already does a cookie warm-up against wnba.com and
-retries once before giving up, and auto-fetch then falls back to pulling
-the game log from ESPN instead. If both sources fail, that's expected
-sometimes -- just fill in the stat fields by hand and keep going; nothing
-else in the notebook depends on the auto-fetch succeeding.
+all). `data_sources.py` does a cookie warm-up against wnba.com and retries
+before giving up, and auto-fetch falls back to ESPN for player stats. If
+you run diagnostics and ESPN also fails, share that output -- it tells us
+exactly which endpoint/shape assumption needs fixing rather than leaving
+it a mystery.
 
 Injury/lineup confirmation is likewise best-effort -- there's no clean
 structured free feed for this, so the **Lineup Confirmed?** checkbox is the
@@ -110,16 +130,16 @@ model will widen its uncertainty (pulling the predicted probability toward
 
 ```
 wnba_predictor/
-  config.py          League/team list, prop type definitions, model defaults
+  config.py          League/team list (15 teams, 2026 season), prop type definitions, model defaults
   odds.py            American odds <-> implied probability, de-vig, edge, CLV, Kelly sizing
-  data_sources.py     stats.wnba.com / ESPN fetchers, all wrapped to fail soft
+  data_sources.py     stats.wnba.com / ESPN fetchers + diagnostics(), all wrapped to fail soft
   stats_engine.py      Rolling averages/hit rates, minutes profile, usage, teammate on/off splits
   matchup.py           Pace/defense ranks, DvP table builder, H2H hit rate, rest/b2b, game environment
   projection.py         Blend + adjustment + distribution model -> predicted probability
   clv.py               Bet logging, outcome recording, calibration report, the learning loop
-  ui.py                 ipywidgets dropdown UI
-WNBA_Prop_Predictor.ipynb   Self-contained Colab notebook
-tests/test_pipeline.py       Synthetic-data sanity tests (no network required)
+  ui.py                 ipywidgets dropdown UI (includes a Run Diagnostics button)
+WNBA_Prop_Predictor.ipynb   Self-contained Colab notebook (diagnostics cell runs before the UI)
+tests/                        Synthetic-data + mocked-response sanity tests (no live network required)
 data/bet_log.csv              Seed CLV/outcome log (headers only)
 ```
 

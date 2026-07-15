@@ -11,7 +11,7 @@ from scipy.stats import norm, poisson
 
 from . import config
 
-N_TEAMS = 13
+N_TEAMS = 15
 
 
 def _rank_lean(rank: Optional[float], cap: float, favorable_at_rank_1: bool) -> float:

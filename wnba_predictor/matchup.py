@@ -9,7 +9,7 @@ import pandas as pd
 from . import stats_engine
 from .odds import implied_team_totals
 
-N_TEAMS = 13
+N_TEAMS = 15
 
 
 def team_pace_and_defense(team_ranks: dict, opponent_team: str) -> dict:

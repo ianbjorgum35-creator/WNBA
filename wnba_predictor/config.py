@@ -1,7 +1,8 @@
 """Static configuration: league structure, prop definitions, and model defaults.
 
-Team roster reflects the 2025 WNBA season (13 teams, including the Golden
-State Valkyries expansion team). Update WNBA_TEAMS if the league realigns.
+Team roster reflects the 2026 WNBA season (15 teams: the 13 from 2025 plus
+the Toronto Tempo and Portland Fire expansion franchises). Update
+WNBA_TEAMS if the league realigns again.
 """
 
 from dataclasses import dataclass, field
@@ -18,7 +19,9 @@ WNBA_TEAMS = [
     {"name": "Minnesota Lynx", "abbr": "MIN"},
     {"name": "New York Liberty", "abbr": "NYL"},
     {"name": "Phoenix Mercury", "abbr": "PHX"},
+    {"name": "Portland Fire", "abbr": "POR"},
     {"name": "Seattle Storm", "abbr": "SEA"},
+    {"name": "Toronto Tempo", "abbr": "TOR"},
     {"name": "Washington Mystics", "abbr": "WAS"},
 ]
 

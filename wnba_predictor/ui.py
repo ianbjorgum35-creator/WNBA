@@ -92,12 +92,14 @@ class PredictorUI:
         self.w_context_note = widgets.Text(description="Context Note", style=s, layout=lay)
 
         self.btn_fetch = widgets.Button(description="Auto-Fetch Data", button_style="info")
+        self.btn_diagnostics = widgets.Button(description="Run Diagnostics")
         self.btn_predict = widgets.Button(description="Run Prediction", button_style="success")
         self.btn_log = widgets.Button(description="Log This Prediction", button_style="warning")
         self.out_fetch = widgets.Output()
         self.out_predict = widgets.Output()
 
         self.btn_fetch.on_click(self._on_fetch)
+        self.btn_diagnostics.on_click(self._on_diagnostics)
         self.btn_predict.on_click(self._on_predict)
         self.btn_log.on_click(self._on_log)
 
@@ -134,7 +136,7 @@ class PredictorUI:
             self.w_pace_rank, self.w_def_rank, self.w_dvp_rank, self.w_h2h_hit,
             widgets.HTML("<h3>Manual Overrides</h3>"),
             self.w_manual_adj, self.w_context_lean, self.w_context_note,
-            widgets.HBox([self.btn_fetch, self.btn_predict, self.btn_log]),
+            widgets.HBox([self.btn_fetch, self.btn_diagnostics, self.btn_predict, self.btn_log]),
             self.out_fetch, self.out_predict,
             widgets.HTML("<h3>Record Outcome for a Past Bet</h3>"),
             widgets.HBox([self.w_pending_bets, self.btn_refresh_pending]),
@@ -163,8 +165,26 @@ class PredictorUI:
                 traceback.print_exc()
             print("Done. Review/edit any fields above, then click Run Prediction.")
 
+    def _on_diagnostics(self, _btn):
+        with self.out_fetch:
+            clear_output()
+            report = data_sources.diagnostics(
+                player_name=self.w_player_name.value or None,
+                player_team_name=self.w_player_team.value or None,
+            )
+            failed = [name for name, entry in report.items() if not entry["ok"]]
+            if failed:
+                print(f"\n{len(failed)} check(s) failed: {', '.join(failed)}. "
+                      "Share this output if you need help fixing it -- it pinpoints exactly "
+                      "which host/step is broken and why.")
+            else:
+                print("\nAll checks passed. If Auto-Fetch still isn't populating fields, "
+                      "something more specific to this player/team is failing -- try Auto-Fetch "
+                      "again and check the messages it prints.")
+
     def _fetch_player_data(self):
         gamelog_res = None
+        source_used = "stats_wnba"
         player_res = data_sources.get_player_id(self.w_player_name.value)
         if player_res.success:
             gamelog_res = data_sources.get_player_gamelog(player_res.data)
@@ -173,11 +193,14 @@ class PredictorUI:
         else:
             print(f"  stats.wnba.com player lookup failed: {player_res.message}")
 
+        espn_opponent_abbr = None
         if gamelog_res is None or not gamelog_res.success:
-            print("  Trying ESPN as a fallback source (unverified against live traffic -- "
-                  "may not match this endpoint's real shape)...")
-            espn_team = TEAM_ABBR[self.w_player_team.value]
-            espn_id_res = data_sources.get_espn_player_id(self.w_player_name.value, espn_team)
+            print("  Trying ESPN as a fallback source...")
+            espn_team_res = data_sources.resolve_espn_team_abbr(self.w_player_team.value)
+            if not espn_team_res.success:
+                print(f"  Could not resolve ESPN team abbreviation: {espn_team_res.message}")
+                return
+            espn_id_res = data_sources.get_espn_player_id(self.w_player_name.value, espn_team_res.data)
             if not espn_id_res.success:
                 print(f"  ESPN player lookup also failed: {espn_id_res.message}")
                 return
@@ -185,6 +208,9 @@ class PredictorUI:
             if not gamelog_res.success:
                 print(f"  ESPN game log fetch also failed: {gamelog_res.message}")
                 return
+            source_used = "espn"
+            espn_opp_res = data_sources.resolve_espn_team_abbr(self.w_opponent_team.value)
+            espn_opponent_abbr = espn_opp_res.data if espn_opp_res.success else None
             print("  Loaded game log from ESPN fallback.")
 
         df = stats_engine.normalize_gamelog(gamelog_res.data)
@@ -209,8 +235,16 @@ class PredictorUI:
         self.w_rotation_role.value = minutes.get("rotation_role") or ""
         print(f"  Player stats loaded from {len(df)} games.")
 
+        if source_used == "espn":
+            espn_own_res = data_sources.resolve_espn_team_abbr(self.w_player_team.value)
+            own_abbr = espn_own_res.data if espn_own_res.success else TEAM_ABBR[self.w_player_team.value]
+            opp_abbr = espn_opponent_abbr or TEAM_ABBR[self.w_opponent_team.value]
+        else:
+            own_abbr = TEAM_ABBR[self.w_player_team.value]
+            opp_abbr = TEAM_ABBR[self.w_opponent_team.value]
+
         h2h = matchup.h2h_hit_rate(
-            df, TEAM_ABBR[self.w_player_team.value], TEAM_ABBR[self.w_opponent_team.value],
+            df, own_abbr, opp_abbr,
             prop_key, self.w_line.value, self.w_direction.value,
         )
         if h2h.get("h2h_hit_rate") is not None:
@@ -221,15 +255,39 @@ class PredictorUI:
         ranks_res = data_sources.get_team_ranks()
         if not ranks_res.success:
             print(f"  Team ranks fetch failed: {ranks_res.message}")
+            print("  (Pace/defense ranks currently have no fallback source -- click "
+                  "Run Diagnostics to see exactly why stats.wnba.com is unreachable, "
+                  "or fill Opp Pace Rank / Opp Defense Rank in by hand for now.)")
+        else:
+            entry = matchup.team_pace_and_defense(ranks_res.data, self.w_opponent_team.value)
+            if entry.get("pace_rank") is not None:
+                self.w_pace_rank.value = entry["pace_rank"]
+            if entry.get("def_rating_rank") is not None:
+                self.w_def_rank.value = entry["def_rating_rank"]
+            print(f"  Opponent ranks loaded: {entry}")
+            print("  DvP rank has no reliable single-endpoint source -- leaving as manual entry "
+                  "(use Opponent Defense Rank as a proxy, or fill in from your own research).")
+
+        own_espn_res = data_sources.resolve_espn_team_abbr(self.w_player_team.value)
+        opp_espn_res = data_sources.resolve_espn_team_abbr(self.w_opponent_team.value)
+        if not (own_espn_res.success and opp_espn_res.success):
+            print("  Could not resolve ESPN team abbreviations -- leaving Home/Away, "
+                  "Rest Days, and Back-to-Back as manual entry.")
             return
-        entry = matchup.team_pace_and_defense(ranks_res.data, self.w_opponent_team.value)
-        if entry.get("pace_rank") is not None:
-            self.w_pace_rank.value = entry["pace_rank"]
-        if entry.get("def_rating_rank") is not None:
-            self.w_def_rank.value = entry["def_rating_rank"]
-        print(f"  Opponent ranks loaded: {entry}")
-        print("  DvP rank has no reliable single-endpoint source -- leaving as manual entry "
-              "(use Opponent Defense Rank as a proxy, or fill in from your own research).")
+        context_res = data_sources.game_context(own_espn_res.data, opp_espn_res.data)
+        if not context_res.success:
+            print(f"  Game context (home/away, rest days) fetch failed: {context_res.message}")
+            print("  Leaving Home/Away, Rest Days, and Back-to-Back as manual entry.")
+            return
+        ctx = context_res.data
+        if ctx.get("is_home") is not None:
+            self.w_home_away.value = "Home" if ctx["is_home"] else "Away"
+        if ctx.get("rest_days") is not None:
+            self.w_rest_days.value = ctx["rest_days"]
+        if ctx.get("is_b2b") is not None:
+            self.w_is_b2b.value = ctx["is_b2b"]
+        print(f"  Game context loaded: {ctx['game_date']}, "
+              f"{'Home' if ctx.get('is_home') else 'Away'}, rest_days={ctx.get('rest_days')}.")
 
     # ------------------------------------------------------------------
     # Prediction

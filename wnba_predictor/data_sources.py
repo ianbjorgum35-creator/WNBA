@@ -20,6 +20,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any, Optional
 
 import requests
@@ -30,16 +31,37 @@ WNBA_STATS_BASE = "https://stats.wnba.com/stats"
 ESPN_SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
 ESPN_CORE_BASE = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba"
 
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# This is the header set the widely-used `nba_api` project relies on to get
+# through stats.nba.com's bot filtering (stats.wnba.com is served by the
+# same platform); missing any of these tends to trigger the silent
+# hang/blackhole behavior rather than a clean error.
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": _UA,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
     "Origin": "https://www.wnba.com",
     "Referer": "https://www.wnba.com/",
+    "Pragma": "no-cache",
+    "Cache-Control": "no-cache",
     "x-nba-stats-origin": "stats",
     "x-nba-stats-token": "true",
 }
+
+# ESPN's site API doesn't need (and shouldn't get) the nba-stats-specific
+# headers above -- keep a separate, plainer header set for it.
+ESPN_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.espn.com/",
+}
+
+ESPN_RETRIES = 2
 
 REQUEST_TIMEOUT = 12
 CACHE_TTL_SECONDS = 60 * 30  # 30 minutes
@@ -176,7 +198,7 @@ def _rows_from_resultsets(payload: dict, result_name: Optional[str] = None):
     return []
 
 
-def get_team_list(season: str = "2025") -> FetchResult:
+def get_team_list(season: str = "2026") -> FetchResult:
     res = _stats_endpoint(
         "leaguedashteamstats",
         {
@@ -197,7 +219,7 @@ def get_team_list(season: str = "2025") -> FetchResult:
     return FetchResult.ok(rows)
 
 
-def get_team_ranks(season: str = "2025") -> FetchResult:
+def get_team_ranks(season: str = "2026") -> FetchResult:
     """Pace + defensive/offensive rating ranks for every team this season."""
     base_res = _stats_endpoint(
         "leaguedashteamstats",
@@ -227,7 +249,7 @@ def get_team_ranks(season: str = "2025") -> FetchResult:
     return FetchResult.ok(ranks)
 
 
-def get_player_id(player_name: str, season: str = "2025") -> FetchResult:
+def get_player_id(player_name: str, season: str = "2026") -> FetchResult:
     res = _stats_endpoint(
         "commonallplayers",
         {"LeagueID": "10", "Season": season, "IsOnlyCurrentSeason": 1},
@@ -249,7 +271,7 @@ def get_player_id(player_name: str, season: str = "2025") -> FetchResult:
     return FetchResult.fail(f"no player found matching '{player_name}'")
 
 
-def get_player_gamelog(player_id, season: str = "2025") -> FetchResult:
+def get_player_gamelog(player_id, season: str = "2026") -> FetchResult:
     """Per-game log for the player: date, opponent, minutes, box score stats."""
     res = _stats_endpoint(
         "playergamelog",
@@ -297,24 +319,132 @@ def get_player_info(player_id) -> FetchResult:
 # ESPN -- injuries, rosters/lineups, schedule (for rest days / back-to-backs)
 # --------------------------------------------------------------------------
 
+def _espn_endpoint(url: str, params: Optional[dict], cache_key: str) -> FetchResult:
+    return _get_json(url, params=params, headers=ESPN_HEADERS, cache_key=cache_key, retries=ESPN_RETRIES)
+
+
 def get_espn_scoreboard(dates: Optional[str] = None) -> FetchResult:
     """dates format YYYYMMDD. Omit for today's slate."""
     params = {"dates": dates} if dates else None
-    return _get_json(f"{ESPN_SITE_BASE}/scoreboard", params=params, cache_key=f"espn_scoreboard_{dates}")
+    return _espn_endpoint(f"{ESPN_SITE_BASE}/scoreboard", params, cache_key=f"espn_scoreboard_{dates}")
 
 
 def get_espn_team_schedule(espn_team_abbr: str, season: Optional[str] = None) -> FetchResult:
     params = {"season": season} if season else None
-    return _get_json(
-        f"{ESPN_SITE_BASE}/teams/{espn_team_abbr}/schedule",
-        params=params,
+    return _espn_endpoint(
+        f"{ESPN_SITE_BASE}/teams/{espn_team_abbr}/schedule", params,
         cache_key=f"espn_schedule_{espn_team_abbr}_{season}",
     )
 
 
 def get_espn_injuries() -> FetchResult:
     """League-wide injury report. ESPN's injuries payload is nested per team."""
-    return _get_json(f"{ESPN_SITE_BASE}/injuries", cache_key="espn_injuries")
+    return _espn_endpoint(f"{ESPN_SITE_BASE}/injuries", None, cache_key="espn_injuries")
+
+
+def get_espn_team_schedule_parsed(espn_team_abbr: str, season: Optional[str] = None) -> FetchResult:
+    """Team schedule flattened into {date, opponent_abbr, is_home, completed}
+    rows, used to auto-derive home/away and rest days instead of asking for
+    them manually."""
+    res = get_espn_team_schedule(espn_team_abbr, season)
+    if not res.success:
+        return res
+    try:
+        games = []
+        for ev in res.data.get("events", []):
+            comps = ev.get("competitions") or []
+            if not comps:
+                continue
+            comp = comps[0]
+            date_str = comp.get("date") or ev.get("date")
+            if not date_str:
+                continue
+            game_date = datetime.fromisoformat(date_str.replace("Z", "+00:00")).date()
+            is_home, opponent_abbr = None, None
+            for c in comp.get("competitors", []):
+                team_abbr = (c.get("team") or {}).get("abbreviation")
+                if team_abbr == espn_team_abbr:
+                    is_home = c.get("homeAway") == "home"
+                else:
+                    opponent_abbr = team_abbr
+            completed = bool(((comp.get("status") or {}).get("type") or {}).get("completed"))
+            games.append({
+                "date": game_date, "opponent_abbr": opponent_abbr,
+                "is_home": is_home, "completed": completed,
+            })
+        if not games:
+            return FetchResult.fail("no games parsed from ESPN schedule")
+        games.sort(key=lambda g: g["date"])
+        return FetchResult.ok(games)
+    except (AttributeError, TypeError, KeyError, ValueError) as exc:
+        return FetchResult.fail(f"unexpected ESPN schedule shape: {exc}")
+
+
+def find_scheduled_game(games: list, opponent_abbr: str) -> Optional[dict]:
+    """Among parsed schedule rows, pick the closest game against the given
+    opponent -- the next upcoming one if there is one, else the most recent
+    past meeting."""
+    matches = [g for g in games if g["opponent_abbr"] == opponent_abbr]
+    if not matches:
+        return None
+    today = date.today()
+    upcoming = [g for g in matches if g["date"] >= today]
+    if upcoming:
+        return min(upcoming, key=lambda g: g["date"])
+    return max(matches, key=lambda g: g["date"])
+
+
+def game_context(espn_team_abbr: str, opponent_espn_abbr: str, season: Optional[str] = None) -> FetchResult:
+    """Auto-derives home/away, rest days, and back-to-back status for the
+    next (or most recent) game between these two teams, so the user doesn't
+    have to enter them by hand."""
+    schedule_res = get_espn_team_schedule_parsed(espn_team_abbr, season)
+    if not schedule_res.success:
+        return schedule_res
+    games = schedule_res.data
+    target = find_scheduled_game(games, opponent_espn_abbr)
+    if target is None:
+        return FetchResult.fail(f"no scheduled game found against {opponent_espn_abbr}")
+    prior_dates = [g["date"] for g in games if g["date"] < target["date"]]
+    rest_days = (target["date"] - max(prior_dates)).days - 1 if prior_dates else None
+    return FetchResult.ok({
+        "game_date": target["date"],
+        "is_home": target["is_home"],
+        "rest_days": rest_days,
+        "is_b2b": rest_days is not None and rest_days <= 0,
+    })
+
+
+def get_espn_teams() -> FetchResult:
+    """Full team index (id, ESPN's own abbreviation, names). Used to resolve
+    our team names to *ESPN's* abbreviation rather than assuming it matches
+    ours -- e.g. Connecticut could be CONN on ESPN vs. our CON -- since a
+    wrong guess there would silently 404 every other ESPN call for that
+    team."""
+    res = _espn_endpoint(f"{ESPN_SITE_BASE}/teams", None, cache_key="espn_teams")
+    if not res.success:
+        return res
+    try:
+        teams = res.data["sports"][0]["leagues"][0]["teams"]
+        return FetchResult.ok([t["team"] for t in teams])
+    except (KeyError, IndexError, TypeError) as exc:
+        return FetchResult.fail(f"unexpected ESPN teams shape: {exc}")
+
+
+def resolve_espn_team_abbr(team_full_name: str) -> FetchResult:
+    teams_res = get_espn_teams()
+    if not teams_res.success:
+        return teams_res
+    name_lower = team_full_name.strip().lower()
+    for t in teams_res.data:
+        display = (t.get("displayName") or "").strip().lower()
+        if display == name_lower:
+            return FetchResult.ok(t.get("abbreviation"))
+    for t in teams_res.data:
+        display = (t.get("displayName") or "").strip().lower()
+        if name_lower in display or display in name_lower:
+            return FetchResult.ok(t.get("abbreviation"), message=f"partial match: {display}")
+    return FetchResult.fail(f"no ESPN team found matching '{team_full_name}'")
 
 
 ESPN_COMMON_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/wnba"
@@ -365,8 +495,8 @@ def get_espn_player_gamelog(athlete_id) -> FetchResult:
     FetchResult.fail rather than raising if the response doesn't match the
     expected shape, so a schema change here degrades safely to manual entry.
     """
-    res = _get_json(
-        f"{ESPN_COMMON_BASE}/athletes/{athlete_id}/gamelog",
+    res = _espn_endpoint(
+        f"{ESPN_COMMON_BASE}/athletes/{athlete_id}/gamelog", None,
         cache_key=f"espn_gamelog_{athlete_id}",
     )
     if not res.success:
@@ -406,8 +536,8 @@ def get_espn_player_gamelog(athlete_id) -> FetchResult:
 
 
 def get_espn_team_roster(espn_team_abbr: str) -> FetchResult:
-    return _get_json(
-        f"{ESPN_SITE_BASE}/teams/{espn_team_abbr}/roster",
+    return _espn_endpoint(
+        f"{ESPN_SITE_BASE}/teams/{espn_team_abbr}/roster", None,
         cache_key=f"espn_roster_{espn_team_abbr}",
     )
 
@@ -421,3 +551,68 @@ def compute_rest_days(team_schedule_rows: list, game_date) -> FetchResult:
     last_game = max(prior_games)
     rest_days = (game_date - last_game).days - 1
     return FetchResult.ok({"rest_days": rest_days, "is_b2b": rest_days <= 0})
+
+
+# --------------------------------------------------------------------------
+# Diagnostics -- run this when auto-fetch isn't pulling anything. It reports
+# exactly which host/endpoint is failing and why (timeout vs. HTTP error vs.
+# an unexpected response shape), instead of leaving you guessing. None of
+# this module could be network-tested from the environment it was built in
+# (its egress policy blocked both stats.wnba.com and espn.com), so the
+# diagnostic output from a real run is the only way to pin down what's
+# actually broken.
+# --------------------------------------------------------------------------
+
+def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[str] = None) -> dict:
+    """player_team_name is the full team name (e.g. "Indiana Fever"), matching
+    what the UI's team dropdown holds -- not an abbreviation."""
+    report = {}
+
+    def _check(name, fn):
+        """Runs fn(), records a report entry, and returns the underlying
+        value on success (FetchResult.data, or the raw return value) so
+        callers can chain off it without re-fetching."""
+        start = time.time()
+        try:
+            result = fn()
+            elapsed = round(time.time() - start, 2)
+            if isinstance(result, FetchResult):
+                report[name] = {
+                    "ok": result.success,
+                    "elapsed_sec": elapsed,
+                    "detail": result.message if not result.success else "ok",
+                    "sample": str(result.data)[:200] if result.success else None,
+                }
+                return result.data if result.success else None
+            report[name] = {"ok": True, "elapsed_sec": elapsed, "sample": str(result)[:200]}
+            return result
+        except Exception as exc:  # noqa: BLE001 -- diagnostics must never raise
+            report[name] = {
+                "ok": False, "elapsed_sec": round(time.time() - start, 2),
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+            return None
+
+    print("Running data-source diagnostics -- this can take up to ~90s if some hosts are blocked...")
+
+    _check("stats_wnba_reachability (team ranks)", get_team_ranks)
+    _check("espn_reachability (scoreboard)", get_espn_scoreboard)
+    _check("espn_teams", get_espn_teams)
+
+    espn_abbr = None
+    if player_team_name:
+        espn_abbr = _check("espn_resolve_team_abbr", lambda: resolve_espn_team_abbr(player_team_name))
+        if espn_abbr:
+            _check("espn_team_roster", lambda: get_espn_team_roster(espn_abbr))
+
+    if player_name:
+        _check("stats_wnba_player_id", lambda: get_player_id(player_name))
+        if espn_abbr:
+            _check("espn_player_id", lambda: get_espn_player_id(player_name, espn_abbr))
+
+    for name, entry in report.items():
+        status = "OK" if entry["ok"] else "FAILED"
+        detail = entry.get("detail", entry.get("sample", ""))
+        print(f"  [{status}] {name} ({entry['elapsed_sec']}s): {detail}")
+
+    return report
