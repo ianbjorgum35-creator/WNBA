@@ -349,64 +349,133 @@ def get_espn_standings() -> FetchResult:
     return _espn_endpoint(f"{ESPN_SITE_BASE}/standings", None, cache_key="espn_standings")
 
 
-def get_espn_team_ranks_fallback() -> FetchResult:
-    """Approximates pace/defense ranks from ESPN standings for when
-    stats.wnba.com is unreachable. Defense rank is a genuine points-allowed
-    rank; "pace" here is only a rough proxy (combined points per game,
-    offense + defense), since ESPN's standings don't expose true
-    possession-based pace -- it's directionally useful but not the same
-    number stats.wnba.com would give you, so it's flagged as a proxy in the
-    returned dict rather than presented as equivalent.
+def _flatten_named_stats(node, out=None) -> dict:
+    """Recursively collects every {"name": ..., "value": <number>} leaf from
+    a nested ESPN stats payload into a flat {name: value} dict. ESPN nests
+    these differently across endpoints (standings vs. per-team statistics),
+    so walking generically is more robust than hardcoding one exact path --
+    the first guess at the standings path turned out not to carry scoring
+    stats at all, which a fixed-path parser would have no way to recover
+    from without another blind guess.
     """
+    if out is None:
+        out = {}
+    if isinstance(node, dict):
+        name, value = node.get("name"), node.get("value")
+        if name and isinstance(value, (int, float)) and not isinstance(value, bool):
+            out.setdefault(name, value)
+        for v in node.values():
+            _flatten_named_stats(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _flatten_named_stats(item, out)
+    return out
+
+
+_OFFENSE_KEY_CANDIDATES = ["pointsFor", "avgPointsFor", "avgPoints", "pointsScored", "points", "PF"]
+_DEFENSE_KEY_CANDIDATES = [
+    "pointsAgainst", "avgPointsAgainst", "avgPointsAllowed", "pointsAllowed", "opponentPoints", "PA",
+]
+_GAMES_KEY_CANDIDATES = ["gamesPlayed", "GP", "games"]
+
+
+def _extract_points_for_against(stat_map: dict) -> tuple:
+    points_for = next((stat_map[k] for k in _OFFENSE_KEY_CANDIDATES if k in stat_map), None)
+    points_against = next((stat_map[k] for k in _DEFENSE_KEY_CANDIDATES if k in stat_map), None)
+    games = next((stat_map[k] for k in _GAMES_KEY_CANDIDATES if k in stat_map), None)
+    # normalize to per-game if these look like season totals rather than averages
+    if points_for is not None and games and points_for > 200:
+        points_for = points_for / games
+        points_against = points_against / games if points_against is not None else None
+    return points_for, points_against
+
+
+def _team_rows_from_standings() -> list:
     res = get_espn_standings()
     if not res.success:
-        return res
+        return []
     try:
         entries = []
         for child in res.data.get("children", []):
             entries.extend((child.get("standings") or {}).get("entries", []))
         if not entries:
             entries = (res.data.get("standings") or {}).get("entries", [])
-
-        team_rows = []
+        rows = []
         for e in entries:
-            team = e.get("team", {})
-            stat_map = {s.get("name"): s.get("value") for s in e.get("stats", []) if s.get("name")}
-            games = stat_map.get("gamesPlayed") or None
-            points_for = stat_map.get("pointsFor") or stat_map.get("avgPointsFor")
-            points_against = stat_map.get("pointsAgainst") or stat_map.get("avgPointsAgainst")
-            if points_for is None or points_against is None:
-                continue
-            # normalize to per-game if these look like season totals rather than averages
-            if games and points_for > 200:
-                points_for, points_against = points_for / games, points_against / games
-            team_rows.append({
-                "team_name": team.get("displayName"),
-                "points_for_pg": points_for,
-                "points_against_pg": points_against,
-            })
+            team_name = (e.get("team") or {}).get("displayName")
+            points_for, points_against = _extract_points_for_against(_flatten_named_stats(e.get("stats", [])))
+            if team_name and points_for is not None and points_against is not None:
+                rows.append({"team_name": team_name, "points_for_pg": points_for, "points_against_pg": points_against})
+        return rows
+    except (AttributeError, TypeError):
+        return []
 
-        if not team_rows:
-            return FetchResult.fail("no usable points-for/against found in ESPN standings")
 
-        by_def = sorted(team_rows, key=lambda t: t["points_against_pg"])  # fewest allowed = rank 1
-        def_rank = {t["team_name"]: i + 1 for i, t in enumerate(by_def)}
-        by_pace = sorted(team_rows, key=lambda t: -(t["points_for_pg"] + t["points_against_pg"]))
-        pace_rank = {t["team_name"]: i + 1 for i, t in enumerate(by_pace)}
+def _team_rows_from_team_statistics() -> list:
+    """Per-team fallback: hits /teams/{abbr}/statistics for every team and
+    flattens whatever scoring stats it finds. Slower (one request per team)
+    but independent of the standings endpoint's field coverage."""
+    teams_res = get_espn_teams()
+    if not teams_res.success:
+        return []
+    rows = []
+    for t in teams_res.data:
+        abbr, team_name = t.get("abbreviation"), t.get("displayName")
+        if not abbr or not team_name:
+            continue
+        res = _espn_endpoint(
+            f"{ESPN_SITE_BASE}/teams/{abbr}/statistics", None, cache_key=f"espn_team_stats_{abbr}",
+        )
+        if not res.success:
+            continue
+        try:
+            points_for, points_against = _extract_points_for_against(_flatten_named_stats(res.data))
+            if points_for is not None and points_against is not None:
+                rows.append({"team_name": team_name, "points_for_pg": points_for, "points_against_pg": points_against})
+        except (AttributeError, TypeError):
+            continue
+    return rows
 
-        ranks = {
-            t["team_name"]: {
-                "pace_rank": pace_rank[t["team_name"]],
-                "def_rating_rank": def_rank[t["team_name"]],
-                "off_rating_rank": None,
-                "net_rating_rank": None,
-                "source": "espn_standings_proxy",
-            }
-            for t in team_rows
+
+def get_espn_team_ranks_fallback() -> FetchResult:
+    """Approximates pace/defense ranks from ESPN when stats.wnba.com is
+    unreachable. Defense rank is a genuine points-allowed rank; "pace" here
+    is only a rough proxy (combined points per game, offense + defense),
+    since ESPN doesn't expose true possession-based pace through these
+    endpoints -- directionally useful, not the same number stats.wnba.com
+    would give you, so it's flagged as a proxy in the returned dict.
+
+    Tries the standings endpoint first (one request, fast); if that
+    endpoint's stat set doesn't include scoring stats, falls back to
+    querying each team's own /statistics endpoint (slower, one request per
+    team, but doesn't depend on standings exposing the same fields).
+    """
+    team_rows = _team_rows_from_standings()
+    source = "espn_standings_proxy"
+    if not team_rows:
+        team_rows = _team_rows_from_team_statistics()
+        source = "espn_team_statistics_proxy"
+    if not team_rows:
+        return FetchResult.fail(
+            "no usable points-for/against found in ESPN standings or per-team statistics"
+        )
+
+    by_def = sorted(team_rows, key=lambda t: t["points_against_pg"])  # fewest allowed = rank 1
+    def_rank = {t["team_name"]: i + 1 for i, t in enumerate(by_def)}
+    by_pace = sorted(team_rows, key=lambda t: -(t["points_for_pg"] + t["points_against_pg"]))
+    pace_rank = {t["team_name"]: i + 1 for i, t in enumerate(by_pace)}
+
+    ranks = {
+        t["team_name"]: {
+            "pace_rank": pace_rank[t["team_name"]],
+            "def_rating_rank": def_rank[t["team_name"]],
+            "off_rating_rank": None,
+            "net_rating_rank": None,
+            "source": source,
         }
-        return FetchResult.ok(ranks)
-    except (AttributeError, TypeError, KeyError, ZeroDivisionError) as exc:
-        return FetchResult.fail(f"unexpected ESPN standings shape: {exc}")
+        for t in team_rows
+    }
+    return FetchResult.ok(ranks)
 
 
 def get_espn_team_schedule_parsed(espn_team_abbr: str, season: Optional[str] = None) -> FetchResult:

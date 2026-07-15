@@ -90,7 +90,14 @@ entirely via ESPN:
 - ESPN's hidden site API is confirmed reachable and is the primary source
   in practice: team/player lookups, rosters, schedules (home/away, rest
   days, back-to-back -- derived automatically, not asked for manually),
-  player game logs, and standings-based pace/defense ranks.
+  and **player game logs** (confirmed working end-to-end from a live Colab
+  run).
+- Team pace/defense ranks try ESPN's standings endpoint first (one
+  request); if that endpoint's stat set doesn't include scoring stats
+  (confirmed to happen -- standings often only carries W-L-PCT-type
+  columns), it falls through to querying each team's own `/statistics`
+  endpoint instead (slower, one request per team, but independent of what
+  standings exposes).
 - `stats.wnba.com` (mirrors the stats.nba.com API shape with `LeagueID=10`)
   is tried first for player game logs and team pace/defense ranks, on the
   chance it's reachable from your environment, but is not required --
@@ -98,7 +105,8 @@ entirely via ESPN:
 
 Since neither host was network-testable from the build sandbox itself,
 **run the diagnostics cell/button** any time something isn't populating --
-it hits every endpoint independently and reports exactly which one is
+it hits every endpoint independently (including the actual gamelog parser
+and both team-ranks fallback tiers) and reports exactly which one is
 failing and why (timeout vs. HTTP error vs. an unexpected response shape).
 Watch the `espn_*` lines specifically, since those are the paths that
 actually matter now. That's also why every auto-fetched field stays a
@@ -109,9 +117,9 @@ Remaining known gap:
 - **Defense-vs-position (DvP) rank** has no reliable free endpoint at all,
   auto-fetch or otherwise; treat opponent defensive rank as a proxy for it,
   or fill it in yourself.
-- The ESPN standings-based pace rank is a **proxy** (combined scoring per
-  game), not true possession-based pace like `stats.wnba.com` would give
-  you -- directionally useful, not numerically identical.
+- The ESPN-derived pace rank is a **proxy** (combined scoring per game),
+  not true possession-based pace like `stats.wnba.com` would give you --
+  directionally useful, not numerically identical.
 
 Injury/lineup confirmation is likewise best-effort -- there's no clean
 structured free feed for this, so the **Lineup Confirmed?** checkbox is the

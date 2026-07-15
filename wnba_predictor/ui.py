@@ -256,12 +256,12 @@ class PredictorUI:
         used_fallback = False
         if not ranks_res.success:
             print(f"  stats.wnba.com team ranks fetch failed: {ranks_res.message}")
-            print("  Trying ESPN standings as a fallback (pace becomes a rough proxy -- "
+            print("  Trying ESPN as a fallback (pace becomes a rough proxy -- "
                   "combined scoring, not true possession-based pace)...")
             ranks_res = data_sources.get_espn_team_ranks_fallback()
             used_fallback = True
             if not ranks_res.success:
-                print(f"  ESPN standings fallback also failed: {ranks_res.message}")
+                print(f"  ESPN fallback also failed: {ranks_res.message}")
                 print("  Fill Opp Pace Rank / Opp Defense Rank in by hand for now.")
 
         if ranks_res.success:
@@ -270,7 +270,8 @@ class PredictorUI:
                 self.w_pace_rank.value = entry["pace_rank"]
             if entry.get("def_rating_rank") is not None:
                 self.w_def_rank.value = entry["def_rating_rank"]
-            note = " (ESPN standings proxy, not stats.wnba.com's real pace metric)" if used_fallback else ""
+            source = entry.get("source")
+            note = f" ({source}, not stats.wnba.com's real pace metric)" if used_fallback and source else ""
             print(f"  Opponent ranks loaded{note}: {entry}")
             print("  DvP rank has no reliable single-endpoint source -- leaving as manual entry "
                   "(use Opponent Defense Rank as a proxy, or fill in from your own research).")

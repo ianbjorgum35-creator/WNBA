@@ -366,20 +366,95 @@ def test_get_espn_team_ranks_fallback_parses_and_ranks(monkeypatch):
         assert team_ranks["pace_rank"] is not None
 
 
-def test_get_espn_team_ranks_fallback_fails_soft_on_unexpected_shape(monkeypatch):
+def test_flatten_named_stats_finds_nested_values():
+    payload = {
+        "splits": [{"categories": [{"stats": [
+            {"name": "avgPointsFor", "value": 82.5},
+            {"name": "avgPointsAgainst", "value": 78.1},
+            {"name": "teamName", "value": "not a number"},  # should be ignored
+        ]}]}]
+    }
+    flat = data_sources._flatten_named_stats(payload)
+    assert flat["avgPointsFor"] == 82.5
+    assert flat["avgPointsAgainst"] == 78.1
+    assert "teamName" not in flat
+
+
+def test_extract_points_for_against_normalizes_season_totals():
+    # season totals (>200) should be divided down to per-game using gamesPlayed
+    stat_map = {"pointsFor": 1800, "pointsAgainst": 1700, "gamesPlayed": 20}
+    points_for, points_against = data_sources._extract_points_for_against(stat_map)
+    assert points_for == 90.0
+    assert points_against == 85.0
+
+
+def test_extract_points_for_against_leaves_per_game_values_alone():
+    stat_map = {"avgPoints": 82.5, "avgPointsAllowed": 78.1}
+    points_for, points_against = data_sources._extract_points_for_against(stat_map)
+    assert points_for == 82.5
+    assert points_against == 78.1
+
+
+def test_get_espn_team_ranks_fallback_falls_through_to_team_statistics(monkeypatch):
+    # Standings has no scoring stats at all (just W-L-PCT, the real-world
+    # failure mode this fallback tier exists for) -- should fall through to
+    # per-team /statistics instead of failing outright.
+    monkeypatch.setattr(
+        data_sources, "get_espn_standings",
+        lambda: data_sources.FetchResult.ok({
+            "children": [{"standings": {"entries": [
+                {"team": {"displayName": "Indiana Fever"},
+                 "stats": [{"name": "wins", "value": 10}, {"name": "losses", "value": 5}]},
+            ]}}]
+        }),
+    )
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.ok([
+            {"abbreviation": "IND", "displayName": "Indiana Fever"},
+            {"abbreviation": "CHI", "displayName": "Chicago Sky"},
+        ]),
+    )
+
+    def fake_espn_endpoint(url, params, cache_key):
+        if "IND" in url:
+            return data_sources.FetchResult.ok({"stats": [
+                {"name": "avgPointsFor", "value": 90.0}, {"name": "avgPointsAgainst", "value": 85.0},
+            ]})
+        return data_sources.FetchResult.ok({"stats": [
+            {"name": "avgPointsFor", "value": 80.0}, {"name": "avgPointsAgainst", "value": 87.5},
+        ]})
+
+    monkeypatch.setattr(data_sources, "_espn_endpoint", fake_espn_endpoint)
+
+    result = data_sources.get_espn_team_ranks_fallback()
+    assert result.success is True
+    assert result.data["Indiana Fever"]["source"] == "espn_team_statistics_proxy"
+    assert result.data["Indiana Fever"]["def_rating_rank"] == 1  # 85.0 allowed < Chicago's 87.5
+
+
+def test_get_espn_team_ranks_fallback_fails_soft_when_both_tiers_empty(monkeypatch):
     monkeypatch.setattr(
         data_sources, "get_espn_standings",
         lambda: data_sources.FetchResult.ok({"nope": True}),
     )
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.fail("also broken"),
+    )
     result = data_sources.get_espn_team_ranks_fallback()
     assert result.success is False
 
 
-def test_get_espn_team_ranks_fallback_propagates_network_failure(monkeypatch):
+def test_get_espn_team_ranks_fallback_falls_through_on_standings_network_failure(monkeypatch):
     monkeypatch.setattr(
         data_sources, "get_espn_standings",
         lambda: data_sources.FetchResult.fail("timed out"),
     )
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.fail("also timed out"),
+    )
     result = data_sources.get_espn_team_ranks_fallback()
     assert result.success is False
-    assert "timed out" in result.message
+    assert "no usable points-for/against" in result.message
