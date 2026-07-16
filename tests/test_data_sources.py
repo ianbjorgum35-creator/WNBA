@@ -234,6 +234,67 @@ def test_dump_espn_gamelog_shape_reports_error(monkeypatch):
     assert "timed out" in summary["error"]
 
 
+def test_dump_espn_gamelog_shape_surfaces_top_level_labels(monkeypatch):
+    # This is exactly what the previous dump missed: labels living at the
+    # payload's top level rather than nested under the category, which is
+    # what caused category_labels to report None against live traffic.
+    fake_payload = {
+        "names": ["MIN", "PTS"],
+        "events": {"401": {"gameDate": "2025-06-01", "opponent": {"abbreviation": "CHI"}}},
+        "seasonTypes": [{"categories": [{"events": [{"eventId": "401", "stats": ["32", "18"]}]}]}],
+    }
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok(fake_payload),
+    )
+    summary = data_sources.dump_espn_gamelog_shape("999")
+    assert summary["top_level_names"] == ["MIN", "PTS"]
+    assert summary["category_labels"] is None  # confirms category-level really is empty here
+
+
+def test_parse_stat_value_extracts_made_count_from_combo_string():
+    assert data_sources._parse_stat_value("1-6") == "1"
+    assert data_sources._parse_stat_value("0-2") == "0"
+    assert data_sources._parse_stat_value("31") == "31"
+    assert data_sources._parse_stat_value(None) is None
+    assert data_sources._parse_stat_value("-5") == "-5"  # not a combo -- leave a real negative alone
+
+
+def test_espn_player_gamelog_falls_back_to_top_level_labels_and_parses_combo_stats(monkeypatch):
+    # Reproduces the real live payload shape: labels at the top level (not
+    # nested under category), and FG/3PT/FT stats formatted as "made-attempted"
+    # combo strings that must be reduced to just the made count.
+    fake_payload = {
+        "names": ["MIN", "REB", "AST", "STL", "BLK", "TO", "PF", "FG", "FG%", "3PT", "3P%", "FT", "FT%", "PTS"],
+        "events": {
+            "401857067": {
+                "gameDate": "2026-07-14T23:00:00.000+00:00", "atVs": "@",
+                "opponent": {"abbreviation": "TOR"},
+            },
+        },
+        "seasonTypes": [{
+            "categories": [{
+                "displayName": "Regular Season",
+                "events": [{
+                    "eventId": "401857067",
+                    "stats": ["31", "2", "2", "4", "0", "2", "2", "1-6", "16.7", "0-2", "0.0", "0-0", "0.0", "2"],
+                }],
+            }],
+        }],
+    }
+    monkeypatch.setattr(
+        data_sources, "_get_json",
+        lambda *a, **k: data_sources.FetchResult.ok(fake_payload),
+    )
+    result = data_sources.get_espn_player_gamelog("999")
+    assert result.success is True
+    row = result.data[0]
+    assert row["MIN"] == "31"
+    assert row["REB"] == "2"
+    assert row["PTS"] == "2"
+    assert row["FG3M"] == "0"  # from the "0-2" 3PT combo -- made count only
+
+
 def _fake_espn_teams_payload():
     return {
         "sports": [{

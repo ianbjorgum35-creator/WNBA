@@ -646,14 +646,28 @@ def get_espn_player_id(player_name: str, espn_team_abbr: str) -> FetchResult:
     return FetchResult.fail(f"no player found matching '{player_name}' on {espn_team_abbr} roster")
 
 
+def _parse_stat_value(raw):
+    """ESPN formats some stats (FG, 3PT, FT) as a combined "made-attempted"
+    string, e.g. "1-6" for 1-for-6 shooting, confirmed live. Passing that
+    through as-is fails downstream numeric parsing entirely, so take the
+    made count when a value looks like that pattern. A real negative number
+    like "-5" has an empty string before the dash and is left alone.
+    """
+    if isinstance(raw, str):
+        parts = raw.split("-")
+        if len(parts) == 2 and all(p.strip().isdigit() for p in parts):
+            return parts[0]
+    return raw
+
+
 def _extract_event_stats(event: dict, labels: list) -> dict:
     """A single game's stats can come back either as a parallel array
-    (event["stats"] = ["32", "18", ...] aligned to the category's label
-    list) or as a list of {"name"/"abbreviation": ..., "value"/"displayValue": ...}
-    dicts (the shape confirmed live for ESPN's per-team /statistics
-    endpoint). Try both rather than assuming one, since guessing wrong here
-    previously produced rows with correct dates/opponents but silently
-    empty stat columns -- a failure that looked like success.
+    (event["stats"] = ["32", "18", ...] aligned to a label list) or as a
+    list of {"name"/"abbreviation": ..., "value"/"displayValue": ...} dicts
+    (the shape confirmed live for ESPN's per-team /statistics endpoint).
+    Try both rather than assuming one, since guessing wrong here previously
+    produced rows with correct dates/opponents but silently empty stat
+    columns -- a failure that looked like success.
     """
     stats = event.get("stats", [])
     row = {}
@@ -665,7 +679,7 @@ def _extract_event_stats(event: dict, labels: list) -> dict:
             if not mapped:
                 continue
             value = s.get("value", s.get("displayValue"))
-            row[mapped] = value
+            row[mapped] = _parse_stat_value(value)
         return row
 
     col_index = {}
@@ -675,7 +689,7 @@ def _extract_event_stats(event: dict, labels: list) -> dict:
             col_index[mapped] = i
     for col, idx in col_index.items():
         if idx < len(stats):
-            row[col] = stats[idx]
+            row[col] = _parse_stat_value(stats[idx])
     return row
 
 
@@ -695,10 +709,14 @@ def get_espn_player_gamelog(athlete_id) -> FetchResult:
     try:
         payload = res.data
         events_meta = payload.get("events", {})
+        # Confirmed live: the label list lives at the payload's top level
+        # (shared across every category), not nested inside each category
+        # -- a category-only lookup silently finds nothing.
+        top_level_labels = payload.get("names") or payload.get("labels") or []
         rows = []
         for season_type in payload.get("seasonTypes", []):
             for category in season_type.get("categories", []):
-                labels = category.get("labels") or category.get("names") or []
+                labels = category.get("labels") or category.get("names") or top_level_labels
                 for event in category.get("events", []):
                     event_id = event.get("eventId") or event.get("id")
                     meta = events_meta.get(str(event_id), {}) if isinstance(events_meta, dict) else {}
@@ -740,6 +758,9 @@ def dump_espn_gamelog_shape(athlete_id) -> dict:
         return {"top_level_type": str(type(payload))}
 
     summary = {"top_level_keys": sorted(payload.keys())}
+    summary["top_level_names"] = payload.get("names")
+    summary["top_level_labels"] = payload.get("labels")
+    summary["top_level_displayNames"] = payload.get("displayNames")
     season_types = payload.get("seasonTypes") or []
     if season_types:
         st0 = season_types[0]
