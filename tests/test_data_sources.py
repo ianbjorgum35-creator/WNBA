@@ -213,8 +213,11 @@ def test_diagnostics_reports_per_check_status(monkeypatch):
     monkeypatch.setattr(data_sources, "get_espn_teams", lambda: data_sources.FetchResult.ok([]))
     monkeypatch.setattr(data_sources, "resolve_espn_team_abbr", lambda name: data_sources.FetchResult.ok("IND"))
     monkeypatch.setattr(data_sources, "get_espn_team_roster", lambda abbr: data_sources.FetchResult.ok({}))
+    monkeypatch.setattr(data_sources, "get_espn_team_schedule_parsed", lambda abbr, season=None: data_sources.FetchResult.ok([]))
+    monkeypatch.setattr(data_sources, "get_espn_team_ranks_fallback", lambda: data_sources.FetchResult.ok({}))
     monkeypatch.setattr(data_sources, "get_player_id", lambda name: data_sources.FetchResult.fail("not found"))
     monkeypatch.setattr(data_sources, "get_espn_player_id", lambda name, abbr: data_sources.FetchResult.ok("123"))
+    monkeypatch.setattr(data_sources, "get_espn_player_gamelog", lambda athlete_id: data_sources.FetchResult.ok([]))
 
     report = data_sources.diagnostics(player_name="Test Player", player_team_name="Indiana Fever")
 
@@ -222,8 +225,28 @@ def test_diagnostics_reports_per_check_status(monkeypatch):
     assert report["espn_reachability (scoreboard)"]["ok"] is False
     assert report["espn_resolve_team_abbr"]["ok"] is True
     assert report["espn_team_roster"]["ok"] is True
+    assert report["espn_team_ranks_fallback (standings)"]["ok"] is True
+    assert "espn_stat_field_names_dump" not in report
     assert report["stats_wnba_player_id"]["ok"] is False
     assert report["espn_player_id"]["ok"] is True
+    assert report["espn_player_gamelog"]["ok"] is True
+
+
+def test_diagnostics_dumps_field_names_when_ranks_fallback_fails(monkeypatch):
+    monkeypatch.setattr(data_sources, "get_team_ranks", lambda: data_sources.FetchResult.fail("blocked"))
+    monkeypatch.setattr(data_sources, "get_espn_scoreboard", lambda: data_sources.FetchResult.ok({}))
+    monkeypatch.setattr(data_sources, "get_espn_teams", lambda: data_sources.FetchResult.ok([]))
+    monkeypatch.setattr(data_sources, "get_espn_team_ranks_fallback", lambda: data_sources.FetchResult.fail("no usable stats"))
+    monkeypatch.setattr(
+        data_sources, "dump_espn_stat_field_names",
+        lambda abbr=None: {"standings_field_names": ["name=wins", "name=losses"]},
+    )
+
+    report = data_sources.diagnostics()
+
+    assert report["espn_team_ranks_fallback (standings)"]["ok"] is False
+    assert "espn_stat_field_names_dump" in report
+    assert "wins" in report["espn_stat_field_names_dump"]["detail"]
 
 
 def _fake_event(game_date, own_abbr, opp_abbr, is_home, completed):
@@ -458,3 +481,41 @@ def test_get_espn_team_ranks_fallback_falls_through_on_standings_network_failure
     result = data_sources.get_espn_team_ranks_fallback()
     assert result.success is False
     assert "no usable points-for/against" in result.message
+
+
+def test_collect_stat_names_finds_names_regardless_of_value_type():
+    payload = {
+        "stats": [
+            {"name": "wins", "value": 10},
+            {"name": "streak", "value": "W3"},  # non-numeric value, still a real stat
+        ],
+        "team": {"abbreviation": "IND"},
+    }
+    names = data_sources._collect_stat_names(payload)
+    assert "name=wins" in names
+    assert "name=streak" in names
+    assert "abbreviation=IND" in names
+
+
+def test_dump_espn_stat_field_names_reports_standings_and_team_stats(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_standings",
+        lambda: data_sources.FetchResult.ok({"stats": [{"name": "wins", "value": 10}]}),
+    )
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok({"stats": [{"name": "ppg", "value": 82.0}]}),
+    )
+    result = data_sources.dump_espn_stat_field_names("IND")
+    assert "name=wins" in result["standings_field_names"]
+    assert "name=ppg" in result["team_statistics_field_names"]
+
+
+def test_dump_espn_stat_field_names_reports_errors(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_standings",
+        lambda: data_sources.FetchResult.fail("timed out"),
+    )
+    result = data_sources.dump_espn_stat_field_names()
+    assert "timed out" in result["standings_error"]
+    assert "team_statistics_field_names" not in result

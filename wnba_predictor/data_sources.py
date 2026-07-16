@@ -379,6 +379,56 @@ _DEFENSE_KEY_CANDIDATES = [
 _GAMES_KEY_CANDIDATES = ["gamesPlayed", "GP", "games"]
 
 
+def _collect_stat_names(node, names=None) -> set:
+    """Like _flatten_named_stats but purely for introspection: collects
+    every distinct 'name'-like key found anywhere in a payload regardless of
+    whether its value looks numeric. Two guesses at ESPN's scoring-stat key
+    names have now come up empty against live traffic, so rather than guess
+    a third time, this lets diagnostics report the *actual* names ESPN uses
+    so the candidate lists above can be fixed precisely instead of blindly.
+    """
+    if names is None:
+        names = set()
+    if isinstance(node, dict):
+        for key in ("name", "abbreviation", "shortDisplayName"):
+            if key in node and isinstance(node[key], str):
+                names.add(f"{key}={node[key]}")
+        for v in node.values():
+            _collect_stat_names(v, names)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_stat_names(item, names)
+    return names
+
+
+def dump_espn_stat_field_names(espn_team_abbr: Optional[str] = None) -> dict:
+    """Introspection helper: lists every distinct stat-name-like key found in
+    the ESPN standings payload, and (if given a team abbreviation) that
+    team's /statistics payload. Run this when get_espn_team_ranks_fallback
+    keeps coming up empty -- it shows what ESPN actually calls its stats
+    instead of leaving that to guesswork.
+    """
+    result = {}
+
+    standings_res = get_espn_standings()
+    if standings_res.success:
+        result["standings_field_names"] = sorted(_collect_stat_names(standings_res.data))
+    else:
+        result["standings_error"] = standings_res.message
+
+    if espn_team_abbr:
+        stats_res = _espn_endpoint(
+            f"{ESPN_SITE_BASE}/teams/{espn_team_abbr}/statistics", None,
+            cache_key=f"espn_team_stats_dump_{espn_team_abbr}",
+        )
+        if stats_res.success:
+            result["team_statistics_field_names"] = sorted(_collect_stat_names(stats_res.data))
+        else:
+            result["team_statistics_error"] = stats_res.message
+
+    return result
+
+
 def _extract_points_for_against(stat_map: dict) -> tuple:
     points_for = next((stat_map[k] for k in _OFFENSE_KEY_CANDIDATES if k in stat_map), None)
     points_against = next((stat_map[k] for k in _DEFENSE_KEY_CANDIDATES if k in stat_map), None)
@@ -734,7 +784,6 @@ def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[st
     _check("stats_wnba_reachability (team ranks)", get_team_ranks)
     _check("espn_reachability (scoreboard)", get_espn_scoreboard)
     _check("espn_teams", get_espn_teams)
-    _check("espn_team_ranks_fallback (standings)", get_espn_team_ranks_fallback)
 
     espn_abbr = None
     if player_team_name:
@@ -742,6 +791,13 @@ def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[st
         if espn_abbr:
             _check("espn_team_roster", lambda: get_espn_team_roster(espn_abbr))
             _check("espn_team_schedule_parsed", lambda: get_espn_team_schedule_parsed(espn_abbr))
+
+    ranks_ok = _check("espn_team_ranks_fallback (standings)", get_espn_team_ranks_fallback)
+    if ranks_ok is None:
+        # Two guesses at ESPN's scoring-stat key names have come up empty --
+        # dump the real field names instead of guessing a third time.
+        dump = dump_espn_stat_field_names(espn_abbr)
+        report["espn_stat_field_names_dump"] = {"ok": True, "elapsed_sec": 0.0, "detail": str(dump)[:1500]}
 
     if player_name:
         _check("stats_wnba_player_id", lambda: get_player_id(player_name))
