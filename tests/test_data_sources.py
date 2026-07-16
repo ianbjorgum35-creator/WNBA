@@ -150,6 +150,90 @@ def test_espn_player_gamelog_fails_soft_on_unexpected_shape(monkeypatch):
     assert result.success is False
 
 
+def test_espn_player_gamelog_parses_name_value_stats_shape(monkeypatch):
+    # Per-event stats as {"name"/"value"} dicts rather than a parallel array
+    # aligned to category labels -- the shape confirmed live for ESPN's
+    # per-team /statistics endpoint, and plausible here too.
+    fake_payload = {
+        "events": {
+            "401": {"gameDate": "2025-06-01", "atVs": "vs", "opponent": {"abbreviation": "CHI"}},
+        },
+        "seasonTypes": [{
+            "categories": [{
+                "labels": [],  # deliberately empty/unused for this shape
+                "events": [
+                    {"eventId": "401", "stats": [
+                        {"name": "PTS", "value": "18"},
+                        {"name": "REB", "value": "6"},
+                    ]},
+                ],
+            }],
+        }],
+    }
+    monkeypatch.setattr(
+        data_sources, "_get_json",
+        lambda *a, **k: data_sources.FetchResult.ok(fake_payload),
+    )
+    result = data_sources.get_espn_player_gamelog("999")
+    assert result.success is True
+    row = result.data[0]
+    assert row["PTS"] == "18"
+    assert row["REB"] == "6"
+
+
+def test_espn_player_gamelog_fails_when_rows_parse_but_no_stats_extracted(monkeypatch):
+    # This is exactly the real-world failure mode observed live: dates and
+    # opponents parse fine (row count looks right, UI reports "N games
+    # loaded"), but the label/stat shape didn't match anything in
+    # _ESPN_STAT_LABEL_MAP, so every stat column would silently be empty.
+    # That must surface as a failure, not a false "success".
+    fake_payload = {
+        "events": {"401": {"gameDate": "2025-06-01", "atVs": "vs", "opponent": {"abbreviation": "CHI"}}},
+        "seasonTypes": [{
+            "categories": [{
+                "labels": ["SomeUnrecognizedLabel"],
+                "events": [{"eventId": "401", "stats": ["99"]}],
+            }],
+        }],
+    }
+    monkeypatch.setattr(
+        data_sources, "_get_json",
+        lambda *a, **k: data_sources.FetchResult.ok(fake_payload),
+    )
+    result = data_sources.get_espn_player_gamelog("999")
+    assert result.success is False
+    assert "no recognizable stat columns" in result.message
+
+
+def test_dump_espn_gamelog_shape_summarizes_structure(monkeypatch):
+    fake_payload = {
+        "events": {"401": {"gameDate": "2025-06-01", "opponent": {"abbreviation": "CHI"}}},
+        "seasonTypes": [{
+            "categories": [{
+                "labels": ["MIN", "PTS"],
+                "events": [{"eventId": "401", "stats": ["32", "18"]}],
+            }],
+        }],
+    }
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok(fake_payload),
+    )
+    summary = data_sources.dump_espn_gamelog_shape("999")
+    assert "seasonTypes" in summary["top_level_keys"]
+    assert summary["category_labels"] == ["MIN", "PTS"]
+    assert summary["sample_event"]["eventId"] == "401"
+
+
+def test_dump_espn_gamelog_shape_reports_error(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.fail("timed out"),
+    )
+    summary = data_sources.dump_espn_gamelog_shape("999")
+    assert "timed out" in summary["error"]
+
+
 def _fake_espn_teams_payload():
     return {
         "sports": [{

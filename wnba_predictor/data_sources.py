@@ -646,6 +646,39 @@ def get_espn_player_id(player_name: str, espn_team_abbr: str) -> FetchResult:
     return FetchResult.fail(f"no player found matching '{player_name}' on {espn_team_abbr} roster")
 
 
+def _extract_event_stats(event: dict, labels: list) -> dict:
+    """A single game's stats can come back either as a parallel array
+    (event["stats"] = ["32", "18", ...] aligned to the category's label
+    list) or as a list of {"name"/"abbreviation": ..., "value"/"displayValue": ...}
+    dicts (the shape confirmed live for ESPN's per-team /statistics
+    endpoint). Try both rather than assuming one, since guessing wrong here
+    previously produced rows with correct dates/opponents but silently
+    empty stat columns -- a failure that looked like success.
+    """
+    stats = event.get("stats", [])
+    row = {}
+
+    if stats and all(isinstance(s, dict) for s in stats):
+        for s in stats:
+            key = s.get("name") or s.get("abbreviation")
+            mapped = _ESPN_STAT_LABEL_MAP.get(str(key).upper()) if key else None
+            if not mapped:
+                continue
+            value = s.get("value", s.get("displayValue"))
+            row[mapped] = value
+        return row
+
+    col_index = {}
+    for i, label in enumerate(labels):
+        mapped = _ESPN_STAT_LABEL_MAP.get(str(label).upper())
+        if mapped:
+            col_index[mapped] = i
+    for col, idx in col_index.items():
+        if idx < len(stats):
+            row[col] = stats[idx]
+    return row
+
+
 def get_espn_player_gamelog(athlete_id) -> FetchResult:
     """Fallback player game log via ESPN's (undocumented) gamelog endpoint,
     used when stats.wnba.com is unreachable. Best-effort: returns
@@ -666,14 +699,8 @@ def get_espn_player_gamelog(athlete_id) -> FetchResult:
         for season_type in payload.get("seasonTypes", []):
             for category in season_type.get("categories", []):
                 labels = category.get("labels") or category.get("names") or []
-                col_index = {}
-                for i, label in enumerate(labels):
-                    mapped = _ESPN_STAT_LABEL_MAP.get(str(label).upper())
-                    if mapped:
-                        col_index[mapped] = i
                 for event in category.get("events", []):
                     event_id = event.get("eventId") or event.get("id")
-                    stats = event.get("stats", [])
                     meta = events_meta.get(str(event_id), {}) if isinstance(events_meta, dict) else {}
                     opponent = (meta.get("opponent") or {}).get("abbreviation", "")
                     at_vs = meta.get("atVs", "vs")
@@ -681,15 +708,57 @@ def get_espn_player_gamelog(athlete_id) -> FetchResult:
                         "GAME_DATE": meta.get("gameDate"),
                         "MATCHUP": f"{at_vs} {opponent}".strip(),
                     }
-                    for col, idx in col_index.items():
-                        if idx < len(stats):
-                            row[col] = stats[idx]
+                    row.update(_extract_event_stats(event, labels))
                     rows.append(row)
         if not rows:
             return FetchResult.fail("ESPN gamelog returned no parsable rows")
+        stat_cols = set(_ESPN_STAT_LABEL_MAP.values())
+        if not any(stat_cols & row.keys() for row in rows):
+            return FetchResult.fail(
+                "ESPN gamelog returned rows (dates/opponents parsed fine) but no recognizable "
+                "stat columns -- the label/stat shape doesn't match what this parser expects"
+            )
         return FetchResult.ok(rows)
     except (AttributeError, TypeError, KeyError, IndexError) as exc:
         return FetchResult.fail(f"unexpected ESPN gamelog shape: {exc}")
+
+
+def dump_espn_gamelog_shape(athlete_id) -> dict:
+    """Introspection helper for get_espn_player_gamelog: returns the raw
+    payload's top-level structure (season type / category / event keys and
+    a sample event) so a parsing mismatch can be fixed from real structure
+    instead of another guess.
+    """
+    res = _espn_endpoint(
+        f"{ESPN_COMMON_BASE}/athletes/{athlete_id}/gamelog", None,
+        cache_key=f"espn_gamelog_{athlete_id}",
+    )
+    if not res.success:
+        return {"error": res.message}
+    payload = res.data
+    if not isinstance(payload, dict):
+        return {"top_level_type": str(type(payload))}
+
+    summary = {"top_level_keys": sorted(payload.keys())}
+    season_types = payload.get("seasonTypes") or []
+    if season_types:
+        st0 = season_types[0]
+        summary["season_type_keys"] = sorted(st0.keys())
+        categories = st0.get("categories") or []
+        if categories:
+            cat0 = categories[0]
+            summary["category_keys"] = sorted(cat0.keys())
+            summary["category_labels"] = cat0.get("labels") or cat0.get("names")
+            events = cat0.get("events") or []
+            if events:
+                summary["sample_event"] = events[0]
+
+    events_meta = payload.get("events")
+    if isinstance(events_meta, dict) and events_meta:
+        first_key = next(iter(events_meta))
+        summary["sample_events_meta_entry"] = events_meta[first_key]
+
+    return summary
 
 
 def get_espn_team_roster(espn_team_abbr: str) -> FetchResult:
@@ -770,7 +839,12 @@ def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[st
         if espn_abbr:
             espn_player_id = _check("espn_player_id", lambda: get_espn_player_id(player_name, espn_abbr))
             if espn_player_id:
-                _check("espn_player_gamelog", lambda: get_espn_player_gamelog(espn_player_id))
+                gamelog_ok = _check("espn_player_gamelog", lambda: get_espn_player_gamelog(espn_player_id))
+                if gamelog_ok is None:
+                    shape = dump_espn_gamelog_shape(espn_player_id)
+                    report["espn_gamelog_shape_dump"] = {
+                        "ok": True, "elapsed_sec": 0.0, "detail": str(shape)[:4000],
+                    }
 
     for name, entry in report.items():
         status = "OK" if entry["ok"] else "FAILED"

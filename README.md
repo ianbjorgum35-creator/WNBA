@@ -89,9 +89,16 @@ entirely via ESPN:
 
 - ESPN's hidden site API is confirmed reachable and is the primary source
   in practice: team/player lookups, rosters, schedules (home/away, rest
-  days, back-to-back -- derived automatically, not asked for manually),
-  and **player game logs** (confirmed working end-to-end from a live Colab
-  run).
+  days, back-to-back -- derived automatically, not asked for manually), and
+  player game logs. The gamelog parser initially had a silent bug: it
+  correctly found the right number of games/dates/opponents (so the UI
+  reported success) but wasn't actually extracting stat values, because it
+  only tried one of the two shapes ESPN uses for per-event stats (a
+  parallel array vs. a list of `{name, value}` pairs). It now tries both,
+  and -- since "right row count but empty stats" is exactly the kind of
+  silent failure that's worse than an honest error -- also fails loudly if
+  no recognizable stat columns come back at all, instead of quietly
+  returning hollow rows.
 - Team pace/defense ranks try ESPN's standings endpoint first (one
   request); confirmed live to not carry scoring stats for this league
   (it's W-L-PCT-only), so this falls through to computing points-for/
