@@ -207,6 +207,8 @@ class PredictorUI:
             gamelog_res = data_sources.get_espn_player_gamelog(espn_id_res.data)
             if not gamelog_res.success:
                 print(f"  ESPN game log fetch also failed: {gamelog_res.message}")
+                shape = data_sources.dump_espn_gamelog_shape(espn_id_res.data)
+                print(f"  Raw shape for debugging (please share this): {str(shape)[:4000]}")
                 return
             source_used = "espn"
             espn_opp_res = data_sources.resolve_espn_team_abbr(self.w_opponent_team.value)
