@@ -261,11 +261,20 @@ def test_parse_stat_value_extracts_made_count_from_combo_string():
 
 
 def test_espn_player_gamelog_falls_back_to_top_level_labels_and_parses_combo_stats(monkeypatch):
-    # Reproduces the real live payload shape: labels at the top level (not
-    # nested under category), and FG/3PT/FT stats formatted as "made-attempted"
-    # combo strings that must be reduced to just the made count.
+    # Reproduces the exact real live payload shape: labels at the top level
+    # (not nested under category), *both* a verbose "names" list ("minutes",
+    # "points", ...) and a short "labels" list ("MIN", "PTS", ...) present
+    # simultaneously (the short one must win, since that's what
+    # _ESPN_STAT_LABEL_MAP is keyed on), and FG/3PT/FT stats formatted as
+    # "made-attempted" combo strings that must be reduced to the made count.
     fake_payload = {
-        "names": ["MIN", "REB", "AST", "STL", "BLK", "TO", "PF", "FG", "FG%", "3PT", "3P%", "FT", "FT%", "PTS"],
+        "names": [
+            "minutes", "points", "totalRebounds", "assists", "steals", "blocks", "turnovers",
+            "fieldGoalsMade-fieldGoalsAttempted", "fieldGoalPct",
+            "threePointFieldGoalsMade-threePointFieldGoalsAttempted", "threePointPct",
+            "freeThrowsMade-freeThrowsAttempted", "freeThrowPct", "fouls",
+        ],
+        "labels": ["MIN", "PTS", "REB", "AST", "STL", "BLK", "TO", "FG", "FG%", "3PT", "3P%", "FT", "FT%", "PF"],
         "events": {
             "401857067": {
                 "gameDate": "2026-07-14T23:00:00.000+00:00", "atVs": "@",
@@ -277,7 +286,7 @@ def test_espn_player_gamelog_falls_back_to_top_level_labels_and_parses_combo_sta
                 "displayName": "Regular Season",
                 "events": [{
                     "eventId": "401857067",
-                    "stats": ["31", "2", "2", "4", "0", "2", "2", "1-6", "16.7", "0-2", "0.0", "0-0", "0.0", "2"],
+                    "stats": ["28", "17", "10", "0", "1", "3", "1", "7-14", "50.0", "0-3", "0.0", "3-4", "75.0", "1"],
                 }],
             }],
         }],
@@ -289,9 +298,14 @@ def test_espn_player_gamelog_falls_back_to_top_level_labels_and_parses_combo_sta
     result = data_sources.get_espn_player_gamelog("999")
     assert result.success is True
     row = result.data[0]
-    assert row["MIN"] == "31"
-    assert row["REB"] == "2"
-    assert row["PTS"] == "2"
+    assert row["MIN"] == "28"
+    assert row["PTS"] == "17"
+    assert row["REB"] == "10"
+    assert row["AST"] == "0"
+    assert row["STL"] == "1"
+    assert row["BLK"] == "3"
+    assert row["TOV"] == "1"
+    assert row["FG3M"] == "0"  # from the "0-3" 3PT combo -- made count only
     assert row["FG3M"] == "0"  # from the "0-2" 3PT combo -- made count only
 
 

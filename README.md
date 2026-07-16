@@ -91,12 +91,14 @@ entirely via ESPN:
   in practice: team/player lookups, rosters, schedules (home/away, rest
   days, back-to-back -- derived automatically, not asked for manually), and
   **player game logs -- confirmed working end-to-end against the real
-  payload shape**. Getting there took a couple of rounds: the label list
-  turned out to live at the payload's top level rather than nested inside
-  each category, and several stats (FG, 3PT, FT) come back as combined
-  "made-attempted" strings like `"1-6"` that need the made count pulled out
-  before they'll parse as numbers. The parser now handles both, and fails
-  loudly (rather than silently returning hollow rows) if a future ESPN
+  payload shape**. Getting there took a few rounds: the label list lives at
+  the payload's top level rather than nested inside each category, that
+  top level actually carries *two* parallel label lists (a verbose one like
+  `"points"` and a short one like `"PTS"`), and several stats (FG, 3PT, FT)
+  come back as combined "made-attempted" strings like `"1-6"` that need the
+  made count pulled out before they'll parse as numbers. The parser now
+  handles all three, and fails loudly (rather than silently returning
+  hollow rows) if a future ESPN
   change breaks it again.
 - Team pace/defense ranks try ESPN's standings endpoint first (one
   request); confirmed live to not carry scoring stats for this league

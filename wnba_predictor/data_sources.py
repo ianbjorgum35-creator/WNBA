@@ -710,9 +710,12 @@ def get_espn_player_gamelog(athlete_id) -> FetchResult:
         payload = res.data
         events_meta = payload.get("events", {})
         # Confirmed live: the label list lives at the payload's top level
-        # (shared across every category), not nested inside each category
-        # -- a category-only lookup silently finds nothing.
-        top_level_labels = payload.get("names") or payload.get("labels") or []
+        # (shared across every category), not nested inside each category.
+        # The payload carries *both* a verbose "names" list ("minutes",
+        # "points", ...) and a short "labels" list ("MIN", "PTS", ...) --
+        # _ESPN_STAT_LABEL_MAP is keyed on the short form, so "labels" must
+        # be tried first or every lookup silently misses.
+        top_level_labels = payload.get("labels") or payload.get("names") or []
         rows = []
         for season_type in payload.get("seasonTypes", []):
             for category in season_type.get("categories", []):
