@@ -93,11 +93,13 @@ entirely via ESPN:
   and **player game logs** (confirmed working end-to-end from a live Colab
   run).
 - Team pace/defense ranks try ESPN's standings endpoint first (one
-  request); if that endpoint's stat set doesn't include scoring stats
-  (confirmed to happen -- standings often only carries W-L-PCT-type
-  columns), it falls through to querying each team's own `/statistics`
-  endpoint instead (slower, one request per team, but independent of what
-  standings exposes).
+  request); confirmed live to not carry scoring stats for this league
+  (it's W-L-PCT-only), so this falls through to computing points-for/
+  against directly from each team's own schedule results instead -- an
+  earlier attempt queried each team's `/statistics` endpoint, but a live
+  field-name dump confirmed that endpoint's "defensive" category is the
+  team's own defensive box-score stats (steals/blocks/rebounds), not
+  points allowed, so there was nothing usable there.
 - `stats.wnba.com` (mirrors the stats.nba.com API shape with `LeagueID=10`)
   is tried first for player game logs and team pace/defense ranks, on the
   chance it's reachable from your environment, but is not required --
@@ -106,11 +108,11 @@ entirely via ESPN:
 Since neither host was network-testable from the build sandbox itself,
 **run the diagnostics cell/button** any time something isn't populating --
 it hits every endpoint independently (including the actual gamelog parser
-and both team-ranks fallback tiers) and reports exactly which one is
-failing and why (timeout vs. HTTP error vs. an unexpected response shape).
-Watch the `espn_*` lines specifically, since those are the paths that
-actually matter now. That's also why every auto-fetched field stays a
-plain editable box regardless: if a fetch ever fails, type the number in
+and the team-ranks fallback) and reports exactly which one is failing and
+why (timeout vs. HTTP error vs. an unexpected response shape). Watch the
+`espn_*` lines specifically, since those are the paths that actually
+matter now. That's also why every auto-fetched field stays a plain
+editable box regardless: if a fetch ever fails, type the number in
 yourself and keep going rather than being blocked.
 
 Remaining known gap:

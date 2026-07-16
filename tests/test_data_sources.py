@@ -225,28 +225,10 @@ def test_diagnostics_reports_per_check_status(monkeypatch):
     assert report["espn_reachability (scoreboard)"]["ok"] is False
     assert report["espn_resolve_team_abbr"]["ok"] is True
     assert report["espn_team_roster"]["ok"] is True
-    assert report["espn_team_ranks_fallback (standings)"]["ok"] is True
-    assert "espn_stat_field_names_dump" not in report
+    assert report["espn_team_ranks_fallback (standings/schedule-scores)"]["ok"] is True
     assert report["stats_wnba_player_id"]["ok"] is False
     assert report["espn_player_id"]["ok"] is True
     assert report["espn_player_gamelog"]["ok"] is True
-
-
-def test_diagnostics_dumps_field_names_when_ranks_fallback_fails(monkeypatch):
-    monkeypatch.setattr(data_sources, "get_team_ranks", lambda: data_sources.FetchResult.fail("blocked"))
-    monkeypatch.setattr(data_sources, "get_espn_scoreboard", lambda: data_sources.FetchResult.ok({}))
-    monkeypatch.setattr(data_sources, "get_espn_teams", lambda: data_sources.FetchResult.ok([]))
-    monkeypatch.setattr(data_sources, "get_espn_team_ranks_fallback", lambda: data_sources.FetchResult.fail("no usable stats"))
-    monkeypatch.setattr(
-        data_sources, "dump_espn_stat_field_names",
-        lambda abbr=None: {"standings_field_names": ["name=wins", "name=losses"]},
-    )
-
-    report = data_sources.diagnostics()
-
-    assert report["espn_team_ranks_fallback (standings)"]["ok"] is False
-    assert "espn_stat_field_names_dump" in report
-    assert "wins" in report["espn_stat_field_names_dump"]["detail"]
 
 
 def _fake_event(game_date, own_abbr, opp_abbr, is_home, completed):
@@ -418,10 +400,10 @@ def test_extract_points_for_against_leaves_per_game_values_alone():
     assert points_against == 78.1
 
 
-def test_get_espn_team_ranks_fallback_falls_through_to_team_statistics(monkeypatch):
+def test_get_espn_team_ranks_fallback_falls_through_to_schedule_scores(monkeypatch):
     # Standings has no scoring stats at all (just W-L-PCT, the real-world
-    # failure mode this fallback tier exists for) -- should fall through to
-    # per-team /statistics instead of failing outright.
+    # failure mode confirmed live for this league) -- should fall through to
+    # computing points-for/against from each team's own schedule results.
     monkeypatch.setattr(
         data_sources, "get_espn_standings",
         lambda: data_sources.FetchResult.ok({
@@ -439,20 +421,24 @@ def test_get_espn_team_ranks_fallback_falls_through_to_team_statistics(monkeypat
         ]),
     )
 
-    def fake_espn_endpoint(url, params, cache_key):
-        if "IND" in url:
-            return data_sources.FetchResult.ok({"stats": [
-                {"name": "avgPointsFor", "value": 90.0}, {"name": "avgPointsAgainst", "value": 85.0},
-            ]})
-        return data_sources.FetchResult.ok({"stats": [
-            {"name": "avgPointsFor", "value": 80.0}, {"name": "avgPointsAgainst", "value": 87.5},
-        ]})
+    def fake_schedule_parsed(abbr, season=None):
+        if abbr == "IND":
+            games = [
+                {"completed": True, "own_score": 92.0, "opponent_score": 85.0},
+                {"completed": True, "own_score": 88.0, "opponent_score": 85.0},
+            ]
+        else:
+            games = [
+                {"completed": True, "own_score": 80.0, "opponent_score": 87.5},
+                {"completed": False, "own_score": None, "opponent_score": None},
+            ]
+        return data_sources.FetchResult.ok(games)
 
-    monkeypatch.setattr(data_sources, "_espn_endpoint", fake_espn_endpoint)
+    monkeypatch.setattr(data_sources, "get_espn_team_schedule_parsed", fake_schedule_parsed)
 
     result = data_sources.get_espn_team_ranks_fallback()
     assert result.success is True
-    assert result.data["Indiana Fever"]["source"] == "espn_team_statistics_proxy"
+    assert result.data["Indiana Fever"]["source"] == "espn_schedule_scores_proxy"
     assert result.data["Indiana Fever"]["def_rating_rank"] == 1  # 85.0 allowed < Chicago's 87.5
 
 
@@ -483,95 +469,68 @@ def test_get_espn_team_ranks_fallback_falls_through_on_standings_network_failure
     assert "no usable points-for/against" in result.message
 
 
-def test_collect_stat_names_finds_names_regardless_of_value_type():
-    payload = {
-        "stats": [
-            {"name": "wins", "value": 10},
-            {"name": "streak", "value": "W3"},  # non-numeric value, still a real stat
-        ],
-        "team": {"abbreviation": "IND"},
-    }
-    names = data_sources._collect_stat_names(payload)
-    assert "name=wins" in names
-    assert "name=streak" in names
-    assert "abbreviation=IND" in names
+def test_parse_espn_score_handles_dict_and_plain_shapes():
+    assert data_sources._parse_espn_score({"value": 82.0}) == 82.0
+    assert data_sources._parse_espn_score({"displayValue": "79"}) == 79.0
+    assert data_sources._parse_espn_score("85") == 85.0
+    assert data_sources._parse_espn_score(None) is None
+    assert data_sources._parse_espn_score({"value": None, "displayValue": "not a number"}) is None
 
 
-def test_dump_espn_stat_field_names_reports_standings_and_team_stats(monkeypatch):
+def test_get_espn_team_schedule_parsed_captures_scores(monkeypatch):
+    fake_payload = {"events": [
+        {
+            "date": "2026-06-01T23:00Z",
+            "competitions": [{
+                "date": "2026-06-01T23:00Z",
+                "competitors": [
+                    {"team": {"abbreviation": "IND"}, "homeAway": "home", "score": {"value": 92.0}},
+                    {"team": {"abbreviation": "CHI"}, "homeAway": "away", "score": {"value": 85.0}},
+                ],
+                "status": {"type": {"completed": True}},
+            }],
+        },
+    ]}
     monkeypatch.setattr(
-        data_sources, "get_espn_standings",
-        lambda: data_sources.FetchResult.ok({"stats": [{"name": "wins", "value": 10}]}),
+        data_sources, "get_espn_team_schedule",
+        lambda abbr, season=None: data_sources.FetchResult.ok(fake_payload),
     )
-    monkeypatch.setattr(
-        data_sources, "_espn_endpoint",
-        lambda url, params, cache_key: data_sources.FetchResult.ok({"stats": [{"name": "ppg", "value": 82.0}]}),
-    )
-    result = data_sources.dump_espn_stat_field_names("IND")
-    assert "name=wins" in result["standings_field_names"]
-    assert "name=ppg" in result["team_statistics_field_names"]
+    result = data_sources.get_espn_team_schedule_parsed("IND")
+    assert result.success is True
+    game = result.data[0]
+    assert game["own_score"] == 92.0
+    assert game["opponent_score"] == 85.0
 
 
-def test_dump_espn_stat_field_names_reports_errors(monkeypatch):
-    monkeypatch.setattr(
-        data_sources, "get_espn_standings",
-        lambda: data_sources.FetchResult.fail("timed out"),
-    )
-    result = data_sources.dump_espn_stat_field_names()
-    assert "timed out" in result["standings_error"]
-    assert "team_statistics_field_names" not in result
-
-
-def _fake_espn_team_statistics_payload(offense_points, defense_points):
-    # Mirrors the real observed shape: category dicts carrying both a
-    # "name" and an "abbreviation" (general/gen, offensive/off,
-    # defensive/def), each with its own stats list. "avgPoints" is
-    # deliberately reused across offensive and defensive categories, since
-    # that's exactly the real-world collision this extractor exists for.
-    return {
-        "results": {"stats": {"categories": [
-            {"name": "general", "abbreviation": "gen", "stats": [
-                {"name": "gamesPlayed", "value": 20},
-            ]},
-            {"name": "offensive", "abbreviation": "off", "stats": [
-                {"name": "avgPoints", "value": offense_points},
-                {"name": "avgAssists", "value": 18.2},
-            ]},
-            {"name": "defensive", "abbreviation": "def", "stats": [
-                {"name": "avgPoints", "value": defense_points},
-                {"name": "avgRebounds", "value": 36.0},
-            ]},
-        ]}}
-    }
-
-
-def test_category_stat_maps_separates_offensive_and_defensive():
-    payload = _fake_espn_team_statistics_payload(82.5, 78.1)
-    categories = data_sources._category_stat_maps(payload)
-    assert categories["offensive"]["avgPoints"] == 82.5
-    assert categories["defensive"]["avgPoints"] == 78.1
-    # the two "avgPoints" occurrences must not collide into one value
-    assert categories["offensive"]["avgPoints"] != categories["defensive"]["avgPoints"]
-
-
-def test_extract_points_for_against_by_category_uses_correct_split():
-    categories = data_sources._category_stat_maps(_fake_espn_team_statistics_payload(82.5, 78.1))
-    points_for, points_against = data_sources._extract_points_for_against_by_category(categories)
-    assert points_for == 82.5
-    assert points_against == 78.1
-
-
-def test_team_rows_from_team_statistics_uses_category_aware_extraction(monkeypatch):
+def test_team_rows_from_schedule_scores_averages_completed_games(monkeypatch):
     monkeypatch.setattr(
         data_sources, "get_espn_teams",
         lambda: data_sources.FetchResult.ok([{"abbreviation": "IND", "displayName": "Indiana Fever"}]),
     )
     monkeypatch.setattr(
-        data_sources, "_espn_endpoint",
-        lambda url, params, cache_key: data_sources.FetchResult.ok(
-            _fake_espn_team_statistics_payload(90.0, 85.0)
-        ),
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.ok([
+            {"completed": True, "own_score": 92.0, "opponent_score": 85.0},
+            {"completed": True, "own_score": 88.0, "opponent_score": 81.0},
+            {"completed": False, "own_score": None, "opponent_score": None},  # not yet played
+        ]),
     )
-    rows = data_sources._team_rows_from_team_statistics()
+    rows = data_sources._team_rows_from_schedule_scores()
     assert len(rows) == 1
     assert rows[0]["points_for_pg"] == 90.0
-    assert rows[0]["points_against_pg"] == 85.0
+    assert rows[0]["points_against_pg"] == 83.0
+
+
+def test_team_rows_from_schedule_scores_skips_teams_with_no_completed_games(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.ok([{"abbreviation": "IND", "displayName": "Indiana Fever"}]),
+    )
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.ok([
+            {"completed": False, "own_score": None, "opponent_score": None},
+        ]),
+    )
+    rows = data_sources._team_rows_from_schedule_scores()
+    assert rows == []

@@ -351,12 +351,9 @@ def get_espn_standings() -> FetchResult:
 
 def _flatten_named_stats(node, out=None) -> dict:
     """Recursively collects every {"name": ..., "value": <number>} leaf from
-    a nested ESPN stats payload into a flat {name: value} dict. ESPN nests
-    these differently across endpoints (standings vs. per-team statistics),
-    so walking generically is more robust than hardcoding one exact path --
-    the first guess at the standings path turned out not to carry scoring
-    stats at all, which a fixed-path parser would have no way to recover
-    from without another blind guess.
+    a nested ESPN stats payload into a flat {name: value} dict. Used for the
+    standings endpoint, which -- confirmed live -- doesn't carry per-category
+    splits the way the per-team /statistics endpoint does.
     """
     if out is None:
         out = {}
@@ -377,124 +374,6 @@ _DEFENSE_KEY_CANDIDATES = [
     "pointsAgainst", "avgPointsAgainst", "avgPointsAllowed", "pointsAllowed", "opponentPoints", "PA",
 ]
 _GAMES_KEY_CANDIDATES = ["gamesPlayed", "GP", "games"]
-
-_DEFENSIVE_CATEGORY_NAMES = {"defensive", "defense", "def"}
-_OFFENSIVE_CATEGORY_NAMES = {"offensive", "offense", "off"}
-_GENERAL_CATEGORY_NAMES = {"general", "gen", "total"}
-
-
-def _category_stat_maps(node, out=None) -> dict:
-    """Walks an ESPN team-statistics payload tracking which category
-    ('general'/'offensive'/'defensive', or however this endpoint spells it)
-    each stat belongs to. ESPN reuses the same stat name (e.g. "avgPoints")
-    across offensive/defensive splits -- under "defensive" it represents
-    what the team *allows*, not scores -- so a plain name->value flatten
-    silently keeps whichever occurrence it sees first and loses the other.
-    Returns {category_name_lowercased: {stat_name: value}}.
-    """
-    if out is None:
-        out = {}
-    if isinstance(node, dict):
-        cat_key = node.get("name") or node.get("abbreviation")
-        stats_list = node.get("stats")
-        if isinstance(cat_key, str) and isinstance(stats_list, list):
-            parsed = {}
-            for s in stats_list:
-                if not isinstance(s, dict):
-                    continue
-                name, value = s.get("name"), s.get("value")
-                if name and isinstance(value, (int, float)) and not isinstance(value, bool):
-                    parsed[name] = value
-            if parsed:
-                out.setdefault(cat_key.lower(), {}).update(parsed)
-        for v in node.values():
-            _category_stat_maps(v, out)
-    elif isinstance(node, list):
-        for item in node:
-            _category_stat_maps(item, out)
-    return out
-
-
-def _pick_category(categories: dict, wanted_names: set) -> dict:
-    for key, stat_map in categories.items():
-        if key in wanted_names:
-            return stat_map
-    return {}
-
-
-def _extract_points_for_against_by_category(categories: dict) -> tuple:
-    """Prefers category-scoped lookup (offensive avgPoints = scored,
-    defensive avgPoints = allowed) over the flat candidate-key search, since
-    the flat search can't distinguish two occurrences of the same name."""
-    offense_map = _pick_category(categories, _OFFENSIVE_CATEGORY_NAMES) or _pick_category(
-        categories, _GENERAL_CATEGORY_NAMES
-    )
-    defense_map = _pick_category(categories, _DEFENSIVE_CATEGORY_NAMES)
-    if not offense_map or not defense_map:
-        return None, None
-    # The category (not the key name) carries the offense/defense meaning --
-    # ESPN reuses the same generic name (e.g. "avgPoints") in both splits --
-    # so search both maps against the same combined candidate list.
-    all_candidates = _OFFENSE_KEY_CANDIDATES + _DEFENSE_KEY_CANDIDATES
-    points_for = next((offense_map[k] for k in all_candidates if k in offense_map), None)
-    points_against = next((defense_map[k] for k in all_candidates if k in defense_map), None)
-    return points_for, points_against
-
-
-def _collect_stat_names(node, names=None) -> set:
-    """Like _flatten_named_stats but purely for introspection: collects
-    every distinct 'name'-like key found anywhere in a payload regardless of
-    whether its value looks numeric. Two guesses at ESPN's scoring-stat key
-    names have now come up empty against live traffic, so rather than guess
-    a third time, this lets diagnostics report the *actual* names ESPN uses
-    so the candidate lists above can be fixed precisely instead of blindly.
-    """
-    if names is None:
-        names = set()
-    if isinstance(node, dict):
-        for key in ("name", "abbreviation", "shortDisplayName"):
-            if key in node and isinstance(node[key], str):
-                names.add(f"{key}={node[key]}")
-        for v in node.values():
-            _collect_stat_names(v, names)
-    elif isinstance(node, list):
-        for item in node:
-            _collect_stat_names(item, names)
-    return names
-
-
-def dump_espn_stat_field_names(espn_team_abbr: Optional[str] = None) -> dict:
-    """Introspection helper: lists every distinct stat-name-like key found in
-    the ESPN standings payload, and (if given a team abbreviation) that
-    team's /statistics payload. Run this when get_espn_team_ranks_fallback
-    keeps coming up empty -- it shows what ESPN actually calls its stats
-    instead of leaving that to guesswork.
-    """
-    result = {}
-
-    standings_res = get_espn_standings()
-    if standings_res.success:
-        result["standings_field_names"] = sorted(_collect_stat_names(standings_res.data))
-    else:
-        result["standings_error"] = standings_res.message
-
-    if espn_team_abbr:
-        stats_res = _espn_endpoint(
-            f"{ESPN_SITE_BASE}/teams/{espn_team_abbr}/statistics", None,
-            cache_key=f"espn_team_stats_dump_{espn_team_abbr}",
-        )
-        if stats_res.success:
-            result["team_statistics_field_names"] = sorted(_collect_stat_names(stats_res.data))
-            # Grouped by category (general/offensive/defensive) with actual
-            # values -- this is what actually resolves ambiguity, since
-            # ESPN reuses names like "avgPoints" across categories with
-            # different meanings (scored vs. allowed) that a flat name list
-            # can't distinguish.
-            result["team_statistics_by_category"] = _category_stat_maps(stats_res.data)
-        else:
-            result["team_statistics_error"] = stats_res.message
-
-    return result
 
 
 def _extract_points_for_against(stat_map: dict) -> tuple:
@@ -529,10 +408,16 @@ def _team_rows_from_standings() -> list:
         return []
 
 
-def _team_rows_from_team_statistics() -> list:
-    """Per-team fallback: hits /teams/{abbr}/statistics for every team and
-    flattens whatever scoring stats it finds. Slower (one request per team)
-    but independent of the standings endpoint's field coverage."""
+def _team_rows_from_schedule_scores() -> list:
+    """Second-tier fallback: computes points-for/against directly from each
+    team's own completed-game scores via get_espn_team_schedule_parsed --
+    the same schedule endpoint already confirmed working for home/away and
+    rest-day derivation. This replaced an earlier attempt that queried each
+    team's /statistics endpoint: a live field-name dump confirmed that
+    endpoint's "defensive" category is the team's own defensive box-score
+    stats (steals/blocks/rebounds), not points allowed -- it simply doesn't
+    carry opponent-scoring data, so there was nothing to parse there.
+    """
     teams_res = get_espn_teams()
     if not teams_res.success:
         return []
@@ -541,21 +426,18 @@ def _team_rows_from_team_statistics() -> list:
         abbr, team_name = t.get("abbreviation"), t.get("displayName")
         if not abbr or not team_name:
             continue
-        res = _espn_endpoint(
-            f"{ESPN_SITE_BASE}/teams/{abbr}/statistics", None, cache_key=f"espn_team_stats_{abbr}",
-        )
-        if not res.success:
+        sched_res = get_espn_team_schedule_parsed(abbr)
+        if not sched_res.success:
             continue
-        try:
-            points_for, points_against = _extract_points_for_against_by_category(_category_stat_maps(res.data))
-            if points_for is None or points_against is None:
-                # fall back to the flat search in case this response isn't
-                # split into offensive/defensive categories after all
-                points_for, points_against = _extract_points_for_against(_flatten_named_stats(res.data))
-            if points_for is not None and points_against is not None:
-                rows.append({"team_name": team_name, "points_for_pg": points_for, "points_against_pg": points_against})
-        except (AttributeError, TypeError):
+        scored_games = [
+            g for g in sched_res.data
+            if g.get("completed") and g.get("own_score") is not None and g.get("opponent_score") is not None
+        ]
+        if not scored_games:
             continue
+        points_for = sum(g["own_score"] for g in scored_games) / len(scored_games)
+        points_against = sum(g["opponent_score"] for g in scored_games) / len(scored_games)
+        rows.append({"team_name": team_name, "points_for_pg": points_for, "points_against_pg": points_against})
     return rows
 
 
@@ -567,19 +449,19 @@ def get_espn_team_ranks_fallback() -> FetchResult:
     endpoints -- directionally useful, not the same number stats.wnba.com
     would give you, so it's flagged as a proxy in the returned dict.
 
-    Tries the standings endpoint first (one request, fast); if that
-    endpoint's stat set doesn't include scoring stats, falls back to
-    querying each team's own /statistics endpoint (slower, one request per
-    team, but doesn't depend on standings exposing the same fields).
+    Tries the standings endpoint first (one request, fast); confirmed live
+    to not carry scoring stats for this league, so this falls back to
+    computing points-for/against from each team's own schedule results
+    (one request per team, but built on data confirmed to actually exist).
     """
     team_rows = _team_rows_from_standings()
     source = "espn_standings_proxy"
     if not team_rows:
-        team_rows = _team_rows_from_team_statistics()
-        source = "espn_team_statistics_proxy"
+        team_rows = _team_rows_from_schedule_scores()
+        source = "espn_schedule_scores_proxy"
     if not team_rows:
         return FetchResult.fail(
-            "no usable points-for/against found in ESPN standings or per-team statistics"
+            "no usable points-for/against found in ESPN standings or schedule scores"
         )
 
     by_def = sorted(team_rows, key=lambda t: t["points_against_pg"])  # fewest allowed = rank 1
@@ -600,10 +482,22 @@ def get_espn_team_ranks_fallback() -> FetchResult:
     return FetchResult.ok(ranks)
 
 
+def _parse_espn_score(raw) -> Optional[float]:
+    if isinstance(raw, dict):
+        raw = raw.get("value", raw.get("displayValue"))
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def get_espn_team_schedule_parsed(espn_team_abbr: str, season: Optional[str] = None) -> FetchResult:
-    """Team schedule flattened into {date, opponent_abbr, is_home, completed}
-    rows, used to auto-derive home/away and rest days instead of asking for
-    them manually."""
+    """Team schedule flattened into {date, opponent_abbr, is_home, completed,
+    own_score, opponent_score} rows. Used to auto-derive home/away and rest
+    days instead of asking for them manually, and (via own_score/
+    opponent_score on completed games) to compute points-for/against
+    directly when neither stats.wnba.com nor ESPN's per-team /statistics
+    endpoint has that data available."""
     res = get_espn_team_schedule(espn_team_abbr, season)
     if not res.success:
         return res
@@ -619,16 +513,21 @@ def get_espn_team_schedule_parsed(espn_team_abbr: str, season: Optional[str] = N
                 continue
             game_date = datetime.fromisoformat(date_str.replace("Z", "+00:00")).date()
             is_home, opponent_abbr = None, None
+            own_score, opponent_score = None, None
             for c in comp.get("competitors", []):
                 team_abbr = (c.get("team") or {}).get("abbreviation")
+                score = _parse_espn_score(c.get("score"))
                 if team_abbr == espn_team_abbr:
                     is_home = c.get("homeAway") == "home"
+                    own_score = score
                 else:
                     opponent_abbr = team_abbr
+                    opponent_score = score
             completed = bool(((comp.get("status") or {}).get("type") or {}).get("completed"))
             games.append({
                 "date": game_date, "opponent_abbr": opponent_abbr,
                 "is_home": is_home, "completed": completed,
+                "own_score": own_score, "opponent_score": opponent_score,
             })
         if not games:
             return FetchResult.fail("no games parsed from ESPN schedule")
@@ -864,14 +763,7 @@ def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[st
             _check("espn_team_roster", lambda: get_espn_team_roster(espn_abbr))
             _check("espn_team_schedule_parsed", lambda: get_espn_team_schedule_parsed(espn_abbr))
 
-    ranks_ok = _check("espn_team_ranks_fallback (standings)", get_espn_team_ranks_fallback)
-    if ranks_ok is None:
-        # Guesses at ESPN's scoring-stat key names have come up empty --
-        # dump the real field names/categories instead of guessing again.
-        dump = dump_espn_stat_field_names(espn_abbr)
-        by_category = dump.get("team_statistics_by_category")
-        detail = str(by_category)[:4000] if by_category else str(dump)[:4000]
-        report["espn_stat_field_names_dump"] = {"ok": True, "elapsed_sec": 0.0, "detail": detail}
+    _check("espn_team_ranks_fallback (standings/schedule-scores)", get_espn_team_ranks_fallback)
 
     if player_name:
         _check("stats_wnba_player_id", lambda: get_player_id(player_name))
