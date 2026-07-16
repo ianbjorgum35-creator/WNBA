@@ -378,6 +378,68 @@ _DEFENSE_KEY_CANDIDATES = [
 ]
 _GAMES_KEY_CANDIDATES = ["gamesPlayed", "GP", "games"]
 
+_DEFENSIVE_CATEGORY_NAMES = {"defensive", "defense", "def"}
+_OFFENSIVE_CATEGORY_NAMES = {"offensive", "offense", "off"}
+_GENERAL_CATEGORY_NAMES = {"general", "gen", "total"}
+
+
+def _category_stat_maps(node, out=None) -> dict:
+    """Walks an ESPN team-statistics payload tracking which category
+    ('general'/'offensive'/'defensive', or however this endpoint spells it)
+    each stat belongs to. ESPN reuses the same stat name (e.g. "avgPoints")
+    across offensive/defensive splits -- under "defensive" it represents
+    what the team *allows*, not scores -- so a plain name->value flatten
+    silently keeps whichever occurrence it sees first and loses the other.
+    Returns {category_name_lowercased: {stat_name: value}}.
+    """
+    if out is None:
+        out = {}
+    if isinstance(node, dict):
+        cat_key = node.get("name") or node.get("abbreviation")
+        stats_list = node.get("stats")
+        if isinstance(cat_key, str) and isinstance(stats_list, list):
+            parsed = {}
+            for s in stats_list:
+                if not isinstance(s, dict):
+                    continue
+                name, value = s.get("name"), s.get("value")
+                if name and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    parsed[name] = value
+            if parsed:
+                out.setdefault(cat_key.lower(), {}).update(parsed)
+        for v in node.values():
+            _category_stat_maps(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _category_stat_maps(item, out)
+    return out
+
+
+def _pick_category(categories: dict, wanted_names: set) -> dict:
+    for key, stat_map in categories.items():
+        if key in wanted_names:
+            return stat_map
+    return {}
+
+
+def _extract_points_for_against_by_category(categories: dict) -> tuple:
+    """Prefers category-scoped lookup (offensive avgPoints = scored,
+    defensive avgPoints = allowed) over the flat candidate-key search, since
+    the flat search can't distinguish two occurrences of the same name."""
+    offense_map = _pick_category(categories, _OFFENSIVE_CATEGORY_NAMES) or _pick_category(
+        categories, _GENERAL_CATEGORY_NAMES
+    )
+    defense_map = _pick_category(categories, _DEFENSIVE_CATEGORY_NAMES)
+    if not offense_map or not defense_map:
+        return None, None
+    # The category (not the key name) carries the offense/defense meaning --
+    # ESPN reuses the same generic name (e.g. "avgPoints") in both splits --
+    # so search both maps against the same combined candidate list.
+    all_candidates = _OFFENSE_KEY_CANDIDATES + _DEFENSE_KEY_CANDIDATES
+    points_for = next((offense_map[k] for k in all_candidates if k in offense_map), None)
+    points_against = next((defense_map[k] for k in all_candidates if k in defense_map), None)
+    return points_for, points_against
+
 
 def _collect_stat_names(node, names=None) -> set:
     """Like _flatten_named_stats but purely for introspection: collects
@@ -423,6 +485,12 @@ def dump_espn_stat_field_names(espn_team_abbr: Optional[str] = None) -> dict:
         )
         if stats_res.success:
             result["team_statistics_field_names"] = sorted(_collect_stat_names(stats_res.data))
+            # Grouped by category (general/offensive/defensive) with actual
+            # values -- this is what actually resolves ambiguity, since
+            # ESPN reuses names like "avgPoints" across categories with
+            # different meanings (scored vs. allowed) that a flat name list
+            # can't distinguish.
+            result["team_statistics_by_category"] = _category_stat_maps(stats_res.data)
         else:
             result["team_statistics_error"] = stats_res.message
 
@@ -479,7 +547,11 @@ def _team_rows_from_team_statistics() -> list:
         if not res.success:
             continue
         try:
-            points_for, points_against = _extract_points_for_against(_flatten_named_stats(res.data))
+            points_for, points_against = _extract_points_for_against_by_category(_category_stat_maps(res.data))
+            if points_for is None or points_against is None:
+                # fall back to the flat search in case this response isn't
+                # split into offensive/defensive categories after all
+                points_for, points_against = _extract_points_for_against(_flatten_named_stats(res.data))
             if points_for is not None and points_against is not None:
                 rows.append({"team_name": team_name, "points_for_pg": points_for, "points_against_pg": points_against})
         except (AttributeError, TypeError):
@@ -794,10 +866,12 @@ def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[st
 
     ranks_ok = _check("espn_team_ranks_fallback (standings)", get_espn_team_ranks_fallback)
     if ranks_ok is None:
-        # Two guesses at ESPN's scoring-stat key names have come up empty --
-        # dump the real field names instead of guessing a third time.
+        # Guesses at ESPN's scoring-stat key names have come up empty --
+        # dump the real field names/categories instead of guessing again.
         dump = dump_espn_stat_field_names(espn_abbr)
-        report["espn_stat_field_names_dump"] = {"ok": True, "elapsed_sec": 0.0, "detail": str(dump)[:1500]}
+        by_category = dump.get("team_statistics_by_category")
+        detail = str(by_category)[:4000] if by_category else str(dump)[:4000]
+        report["espn_stat_field_names_dump"] = {"ok": True, "elapsed_sec": 0.0, "detail": detail}
 
     if player_name:
         _check("stats_wnba_player_id", lambda: get_player_id(player_name))

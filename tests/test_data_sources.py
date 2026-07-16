@@ -519,3 +519,59 @@ def test_dump_espn_stat_field_names_reports_errors(monkeypatch):
     result = data_sources.dump_espn_stat_field_names()
     assert "timed out" in result["standings_error"]
     assert "team_statistics_field_names" not in result
+
+
+def _fake_espn_team_statistics_payload(offense_points, defense_points):
+    # Mirrors the real observed shape: category dicts carrying both a
+    # "name" and an "abbreviation" (general/gen, offensive/off,
+    # defensive/def), each with its own stats list. "avgPoints" is
+    # deliberately reused across offensive and defensive categories, since
+    # that's exactly the real-world collision this extractor exists for.
+    return {
+        "results": {"stats": {"categories": [
+            {"name": "general", "abbreviation": "gen", "stats": [
+                {"name": "gamesPlayed", "value": 20},
+            ]},
+            {"name": "offensive", "abbreviation": "off", "stats": [
+                {"name": "avgPoints", "value": offense_points},
+                {"name": "avgAssists", "value": 18.2},
+            ]},
+            {"name": "defensive", "abbreviation": "def", "stats": [
+                {"name": "avgPoints", "value": defense_points},
+                {"name": "avgRebounds", "value": 36.0},
+            ]},
+        ]}}
+    }
+
+
+def test_category_stat_maps_separates_offensive_and_defensive():
+    payload = _fake_espn_team_statistics_payload(82.5, 78.1)
+    categories = data_sources._category_stat_maps(payload)
+    assert categories["offensive"]["avgPoints"] == 82.5
+    assert categories["defensive"]["avgPoints"] == 78.1
+    # the two "avgPoints" occurrences must not collide into one value
+    assert categories["offensive"]["avgPoints"] != categories["defensive"]["avgPoints"]
+
+
+def test_extract_points_for_against_by_category_uses_correct_split():
+    categories = data_sources._category_stat_maps(_fake_espn_team_statistics_payload(82.5, 78.1))
+    points_for, points_against = data_sources._extract_points_for_against_by_category(categories)
+    assert points_for == 82.5
+    assert points_against == 78.1
+
+
+def test_team_rows_from_team_statistics_uses_category_aware_extraction(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.ok([{"abbreviation": "IND", "displayName": "Indiana Fever"}]),
+    )
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok(
+            _fake_espn_team_statistics_payload(90.0, 85.0)
+        ),
+    )
+    rows = data_sources._team_rows_from_team_statistics()
+    assert len(rows) == 1
+    assert rows[0]["points_for_pg"] == 90.0
+    assert rows[0]["points_against_pg"] == 85.0
