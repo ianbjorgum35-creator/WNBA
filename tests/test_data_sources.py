@@ -693,3 +693,188 @@ def test_team_rows_from_schedule_scores_skips_teams_with_no_completed_games(monk
     )
     rows = data_sources._team_rows_from_schedule_scores()
     assert rows == []
+
+
+def _fake_boxscore_payload():
+    return {
+        "boxscore": {
+            "teams": [
+                {"team": {"abbreviation": "CHI"}, "statistics": [
+                    {"name": "PTS", "displayValue": "82"},
+                    {"name": "REB", "displayValue": "34"},
+                    {"name": "3PT", "displayValue": "8-22"},
+                ]},
+                {"team": {"abbreviation": "IND"}, "statistics": [
+                    {"name": "PTS", "displayValue": "79"},
+                ]},
+            ]
+        }
+    }
+
+
+def test_get_espn_boxscore_team_stats_parses_expected_shape(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok(_fake_boxscore_payload()),
+    )
+    result = data_sources.get_espn_boxscore_team_stats("401", "CHI")
+    assert result.success is True
+    assert result.data["PTS"] == 82.0
+    assert result.data["REB"] == 34.0
+    assert result.data["FG3M"] == 8.0  # from the "8-22" combo -- made count only
+
+
+def test_get_espn_boxscore_team_stats_team_not_found(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok(_fake_boxscore_payload()),
+    )
+    result = data_sources.get_espn_boxscore_team_stats("401", "NYL")
+    assert result.success is False
+
+
+def test_get_espn_boxscore_team_stats_fails_soft_on_unexpected_shape(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok({"nope": True}),
+    )
+    result = data_sources.get_espn_boxscore_team_stats("401", "CHI")
+    assert result.success is False
+
+
+def test_team_allowed_stat_avg_averages_recent_completed_games(monkeypatch):
+    games = [
+        {"completed": True, "event_id": "1", "opponent_abbr": "CHI"},
+        {"completed": True, "event_id": "2", "opponent_abbr": "NYL"},
+        {"completed": False, "event_id": None, "opponent_abbr": None},
+    ]
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.ok(games),
+    )
+    boxscores = {"1": {"PTS": 80.0, "REB": 30.0}, "2": {"PTS": 90.0, "REB": 40.0}}
+    monkeypatch.setattr(
+        data_sources, "get_espn_boxscore_team_stats",
+        lambda event_id, team_abbr: data_sources.FetchResult.ok(boxscores[event_id]),
+    )
+
+    avg = data_sources._team_allowed_stat_avg("IND", ("PTS",), n_games=8)
+    assert avg == 85.0  # (80 + 90) / 2
+
+    avg_combo = data_sources._team_allowed_stat_avg("IND", ("PTS", "REB"), n_games=8)
+    assert avg_combo == 120.0  # ((80+30) + (90+40)) / 2
+
+
+def test_team_allowed_stat_avg_skips_games_missing_needed_columns(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.ok([
+            {"completed": True, "event_id": "1", "opponent_abbr": "CHI"},
+        ]),
+    )
+    monkeypatch.setattr(
+        data_sources, "get_espn_boxscore_team_stats",
+        lambda event_id, team_abbr: data_sources.FetchResult.ok({"PTS": 80.0}),  # missing REB
+    )
+    avg = data_sources._team_allowed_stat_avg("IND", ("PTS", "REB"), n_games=8)
+    assert avg is None
+
+
+def test_team_allowed_stat_avg_returns_none_on_schedule_failure(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.fail("timed out"),
+    )
+    assert data_sources._team_allowed_stat_avg("IND", ("PTS",)) is None
+
+
+def test_get_espn_stat_allowed_ranks_ranks_teams_correctly(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.ok([
+            {"abbreviation": "IND", "displayName": "Indiana Fever"},
+            {"abbreviation": "CHI", "displayName": "Chicago Sky"},
+            {"abbreviation": "NYL", "displayName": "New York Liberty"},
+        ]),
+    )
+    avgs = {"IND": 90.0, "CHI": 80.0, "NYL": 95.0}
+    monkeypatch.setattr(
+        data_sources, "_team_allowed_stat_avg",
+        lambda abbr, cols, n_games=8: avgs.get(abbr),
+    )
+    result = data_sources.get_espn_stat_allowed_ranks("PTS")
+    assert result.success is True
+    assert result.data["New York Liberty"]["stat_allowed_rank"] == 1  # allows the most
+    assert result.data["Indiana Fever"]["stat_allowed_rank"] == 2
+    assert result.data["Chicago Sky"]["stat_allowed_rank"] == 3
+    for entry in result.data.values():
+        assert entry["source"] == "espn_boxscore_recent_games"
+
+
+def test_get_espn_stat_allowed_ranks_unknown_prop_key():
+    result = data_sources.get_espn_stat_allowed_ranks("NOT_A_REAL_PROP")
+    assert result.success is False
+
+
+def test_get_espn_stat_allowed_ranks_fails_soft_when_no_data(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "get_espn_teams",
+        lambda: data_sources.FetchResult.ok([{"abbreviation": "IND", "displayName": "Indiana Fever"}]),
+    )
+    monkeypatch.setattr(data_sources, "_team_allowed_stat_avg", lambda abbr, cols, n_games=8: None)
+    result = data_sources.get_espn_stat_allowed_ranks("PTS")
+    assert result.success is False
+
+
+def test_get_espn_stat_allowed_ranks_propagates_teams_failure(monkeypatch):
+    monkeypatch.setattr(data_sources, "get_espn_teams", lambda: data_sources.FetchResult.fail("timed out"))
+    result = data_sources.get_espn_stat_allowed_ranks("PTS")
+    assert result.success is False
+
+
+def test_dump_espn_boxscore_shape_summarizes_structure(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.ok(_fake_boxscore_payload()),
+    )
+    summary = data_sources.dump_espn_boxscore_shape("401")
+    assert "boxscore" in summary["top_level_keys"]
+    assert "teams" in summary["boxscore_keys"]
+    assert len(summary["sample_statistic_entries"]) > 0
+
+
+def test_dump_espn_boxscore_shape_reports_error(monkeypatch):
+    monkeypatch.setattr(
+        data_sources, "_espn_endpoint",
+        lambda url, params, cache_key: data_sources.FetchResult.fail("timed out"),
+    )
+    summary = data_sources.dump_espn_boxscore_shape("401")
+    assert "timed out" in summary["error"]
+
+
+def test_diagnostics_dumps_boxscore_shape_when_check_fails(monkeypatch):
+    monkeypatch.setattr(data_sources, "get_team_ranks", lambda: data_sources.FetchResult.ok({}))
+    monkeypatch.setattr(data_sources, "get_espn_scoreboard", lambda: data_sources.FetchResult.ok({}))
+    monkeypatch.setattr(data_sources, "get_espn_teams", lambda: data_sources.FetchResult.ok([]))
+    monkeypatch.setattr(data_sources, "resolve_espn_team_abbr", lambda name: data_sources.FetchResult.ok("IND"))
+    monkeypatch.setattr(data_sources, "get_espn_team_roster", lambda abbr: data_sources.FetchResult.ok({}))
+    monkeypatch.setattr(
+        data_sources, "get_espn_team_schedule_parsed",
+        lambda abbr, season=None: data_sources.FetchResult.ok([
+            {"completed": True, "event_id": "401", "opponent_abbr": "CHI"},
+        ]),
+    )
+    monkeypatch.setattr(
+        data_sources, "get_espn_boxscore_team_stats",
+        lambda event_id, team_abbr: data_sources.FetchResult.fail("boom"),
+    )
+    monkeypatch.setattr(
+        data_sources, "dump_espn_boxscore_shape",
+        lambda event_id: {"top_level_keys": ["boxscore"]},
+    )
+    monkeypatch.setattr(data_sources, "get_espn_team_ranks_fallback", lambda: data_sources.FetchResult.ok({}))
+
+    report = data_sources.diagnostics(player_team_name="Indiana Fever")
+
+    assert report["espn_boxscore_team_stats (DvP replacement)"]["ok"] is False
+    assert "espn_boxscore_shape_dump" in report

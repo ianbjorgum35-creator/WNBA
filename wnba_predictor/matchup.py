@@ -1,9 +1,8 @@
-"""Game-environment and matchup factors: pace/defense ranks, DvP, H2H, rest."""
+"""Game-environment and matchup factors: pace/defense ranks, opponent-allowed-stat rank, H2H, rest."""
 
 from datetime import date
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 from . import stats_engine
@@ -20,6 +19,17 @@ def team_pace_and_defense(team_ranks: dict, opponent_team: str) -> dict:
     return entry
 
 
+def team_stat_allowed_rank(stat_ranks: dict, opponent_team: str) -> dict:
+    """Look up the opponent's rank from data_sources.get_espn_stat_allowed_ranks
+    output -- the DvP replacement (team-level, stat-specific, not
+    position-specific: "how much of this stat does this opponent give up
+    per game, ranked league-wide," rank 1 = allows the most)."""
+    entry = stat_ranks.get(opponent_team)
+    if entry is None:
+        return {"stat_allowed_rank": None, "stat_allowed_avg": None, "note": "team not found"}
+    return entry
+
+
 def _extract_opponent_from_matchup(matchup: str, own_team_abbr: str) -> Optional[str]:
     if not isinstance(matchup, str):
         return None
@@ -29,48 +39,6 @@ def _extract_opponent_from_matchup(matchup: str, own_team_abbr: str) -> Optional
         if p and p != own_team_abbr:
             return p
     return None
-
-
-def build_dvp_table(league_gamelog: pd.DataFrame, prop_key: str) -> pd.DataFrame:
-    """Defense-vs-position table built from a combined league game log.
-
-    Expects columns: PLAYER_TEAM_ABBR, POSITION, MATCHUP, plus the raw box
-    score columns needed for `prop_key`. Returns one row per
-    (opponent, position) with the average allowed and a 1..N_TEAMS rank
-    (1 = allows the most = most favorable matchup for that position/prop).
-    """
-    df = league_gamelog.copy()
-    if df.empty or "POSITION" not in df.columns or "MATCHUP" not in df.columns:
-        return pd.DataFrame(columns=["OPPONENT", "POSITION", "allowed_avg", "dvp_rank"])
-
-    df["OPPONENT"] = df.apply(
-        lambda r: _extract_opponent_from_matchup(r.get("MATCHUP"), r.get("PLAYER_TEAM_ABBR", "")), axis=1
-    )
-    df["STAT_VALUE"] = stats_engine.stat_series(df, prop_key)
-
-    grouped = (
-        df.dropna(subset=["OPPONENT", "POSITION"])
-        .groupby(["OPPONENT", "POSITION"])["STAT_VALUE"]
-        .mean()
-        .reset_index()
-        .rename(columns={"STAT_VALUE": "allowed_avg"})
-    )
-    grouped["dvp_rank"] = grouped.groupby("POSITION")["allowed_avg"].rank(
-        ascending=False, method="min"
-    )
-    return grouped
-
-
-def dvp_rank_for(dvp_table: pd.DataFrame, opponent_team_abbr: str, position: str) -> dict:
-    if dvp_table.empty:
-        return {"dvp_rank": None, "allowed_avg": None, "note": "no DvP table available"}
-    row = dvp_table[
-        (dvp_table["OPPONENT"] == opponent_team_abbr) & (dvp_table["POSITION"] == position)
-    ]
-    if row.empty:
-        return {"dvp_rank": None, "allowed_avg": None, "note": "no matching rows"}
-    r = row.iloc[0]
-    return {"dvp_rank": float(r["dvp_rank"]), "allowed_avg": float(r["allowed_avg"])}
 
 
 def h2h_hit_rate(player_gamelog: pd.DataFrame, own_team_abbr: str, opponent_team_abbr: str,

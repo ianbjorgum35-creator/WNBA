@@ -112,6 +112,20 @@ def test_game_environment():
     assert env["team_implied_total"] + env["opponent_implied_total"] == pytest.approx(165)
 
 
+def test_team_stat_allowed_rank_looks_up_opponent():
+    stat_ranks = {
+        "Chicago Sky": {"stat_allowed_rank": 3, "stat_allowed_avg": 34.2, "source": "espn_boxscore_recent_games"},
+    }
+    result = matchup.team_stat_allowed_rank(stat_ranks, "Chicago Sky")
+    assert result["stat_allowed_rank"] == 3
+
+
+def test_team_stat_allowed_rank_missing_team():
+    result = matchup.team_stat_allowed_rank({}, "Chicago Sky")
+    assert result["stat_allowed_rank"] is None
+    assert result["note"] == "team not found"
+
+
 def test_run_prediction_end_to_end():
     df = stats_engine.normalize_gamelog(_synthetic_gamelog(mean_pts=18, mean_min=30))
     rolling = stats_engine.rolling_windows(df, "PTS", line=17.5, direction="Over")

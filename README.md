@@ -40,10 +40,11 @@ role, and a teammate usage/minutes "bump" estimate (from on/off splits when
 a teammate is out).
 
 **Matchup / game environment:** opponent pace rank, opponent defensive
-rank, defense-vs-position (DvP) rank, game total, spread, home/away, rest
-days, back-to-back flag, head-to-head hit rate vs. this opponent, plus a
-manual matchup adjustment slider and a free-text "context lean" you can
-enter yourself (e.g. an injury note, a pace mismatch you noticed).
+rank, a DvP-replacement "opponent stat-allowed" rank (see below), game
+total, spread, home/away, rest days, back-to-back flag, head-to-head hit
+rate vs. this opponent, plus a manual matchup adjustment slider and a
+free-text "context lean" you can enter yourself (e.g. an injury note, a
+pace mismatch you noticed).
 
 These are blended into a projected mean and variance (weighted by
 recency-window blend weights that the learning loop tunes over time),
@@ -123,13 +124,26 @@ matter now. That's also why every auto-fetched field stays a plain
 editable box regardless: if a fetch ever fails, type the number in
 yourself and keep going rather than being blocked.
 
-Remaining known gap:
-- **Defense-vs-position (DvP) rank** has no reliable free endpoint at all,
-  auto-fetch or otherwise; treat opponent defensive rank as a proxy for it,
-  or fill it in yourself.
-- The ESPN-derived pace rank is a **proxy** (combined scoring per game),
-  not true possession-based pace like `stats.wnba.com` would give you --
-  directionally useful, not numerically identical.
+**DvP (defense-vs-position) is auto-fetched too, but as a team-level
+proxy, not truly position-specific.** True DvP needs a league-wide database
+of what every team allows broken out by position, which doesn't exist
+through any free endpoint found so far -- building it ourselves would mean
+fetching every player's game log on every opposing roster, which is a lot
+of fragile requests for a return. Instead, `get_espn_stat_allowed_ranks()`
+computes "how much of this prop's stat does this opponent give up per game,
+ranked league-wide" from each team's last 8 completed boxscores (reusing
+the same schedule data already proven working, extended with a per-game
+boxscore lookup). Rank 1 = allows the most = most favorable for the Over,
+same convention as before. The tradeoff: it can tell you "this team gives
+up a lot of rebounds," not "this team is soft on guards specifically." This
+is noticeably slower than the other auto-fetches (~15 teams x up to 8
+boxscore requests each to build the full league table), so expect Auto-Fetch
+to pause for a bit longer on this step; each boxscore is cached for the
+rest of the session since a completed game's stats never change.
+
+The ESPN-derived pace rank is a **proxy** (combined scoring per game), not
+true possession-based pace like `stats.wnba.com` would give you --
+directionally useful, not numerically identical.
 
 Injury/lineup confirmation is likewise best-effort -- there's no clean
 structured free feed for this, so the **Lineup Confirmed?** checkbox is the
@@ -145,7 +159,7 @@ wnba_predictor/
   odds.py            American odds <-> implied probability, de-vig, edge, CLV, Kelly sizing
   data_sources.py     stats.wnba.com / ESPN fetchers + diagnostics(), all wrapped to fail soft
   stats_engine.py      Rolling averages/hit rates, minutes profile, usage, teammate on/off splits
-  matchup.py           Pace/defense ranks, DvP table builder, H2H hit rate, rest/b2b, game environment
+  matchup.py           Pace/defense ranks, opponent stat-allowed (DvP proxy) rank, H2H hit rate, rest/b2b, game environment
   projection.py         Blend + adjustment + distribution model -> predicted probability
   clv.py               Bet logging, outcome recording, calibration report, the learning loop
   ui.py                 ipywidgets dropdown UI (includes a Run Diagnostics button)

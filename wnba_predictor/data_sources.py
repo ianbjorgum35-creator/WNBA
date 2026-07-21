@@ -493,11 +493,10 @@ def _parse_espn_score(raw) -> Optional[float]:
 
 def get_espn_team_schedule_parsed(espn_team_abbr: str, season: Optional[str] = None) -> FetchResult:
     """Team schedule flattened into {date, opponent_abbr, is_home, completed,
-    own_score, opponent_score} rows. Used to auto-derive home/away and rest
-    days instead of asking for them manually, and (via own_score/
-    opponent_score on completed games) to compute points-for/against
-    directly when neither stats.wnba.com nor ESPN's per-team /statistics
-    endpoint has that data available."""
+    own_score, opponent_score, event_id} rows. Used to auto-derive home/away
+    and rest days instead of asking for them manually, to compute points-for/
+    against directly when stats.wnba.com is unreachable, and (via event_id)
+    to look up full boxscores for opponent-allowed-stat ranking."""
     res = get_espn_team_schedule(espn_team_abbr, season)
     if not res.success:
         return res
@@ -528,6 +527,7 @@ def get_espn_team_schedule_parsed(espn_team_abbr: str, season: Optional[str] = N
                 "date": game_date, "opponent_abbr": opponent_abbr,
                 "is_home": is_home, "completed": completed,
                 "own_score": own_score, "opponent_score": opponent_score,
+                "event_id": ev.get("id") or comp.get("id"),
             })
         if not games:
             return FetchResult.fail("no games parsed from ESPN schedule")
@@ -785,6 +785,145 @@ def dump_espn_gamelog_shape(athlete_id) -> dict:
     return summary
 
 
+# --------------------------------------------------------------------------
+# Opponent-allowed stat ranking -- the DvP replacement. True defense-vs-
+# position needs a league-wide database of what every team allows broken
+# out by position, which doesn't exist through any free endpoint found so
+# far. This computes a team-level (not position-specific) version instead:
+# "how much of this stat does this opponent give up per game, ranked
+# league-wide" -- reusing the same schedule data already proven working,
+# extended with a per-game boxscore lookup for stats beyond final score.
+# --------------------------------------------------------------------------
+
+def get_espn_boxscore_team_stats(event_id, team_abbr: str) -> FetchResult:
+    """Fetches one game's boxscore and returns a flat {our_column: value}
+    dict of every recognized stat for the given team -- i.e. what that team
+    produced in this game. Called with the *opponent* of the team you're
+    evaluating, since "what they produced" is "what the evaluated team
+    allowed." Reuses _ESPN_STAT_LABEL_MAP and _parse_stat_value (the same
+    machinery that made the gamelog parser work) since ESPN's boxscore
+    "statistics" entries follow the same name/abbreviation + value shape.
+    """
+    res = _espn_endpoint(
+        f"{ESPN_SITE_BASE}/summary", {"event": event_id},
+        cache_key=f"espn_boxscore_{event_id}",
+    )
+    if not res.success:
+        return res
+    try:
+        teams = res.data["boxscore"]["teams"]
+        target = next((t for t in teams if (t.get("team") or {}).get("abbreviation") == team_abbr), None)
+        if target is None:
+            return FetchResult.fail(f"team {team_abbr} not found in boxscore for event {event_id}")
+        stat_map = {}
+        for s in target.get("statistics", []):
+            key = s.get("name") or s.get("abbreviation") or s.get("label")
+            mapped = _ESPN_STAT_LABEL_MAP.get(str(key).upper()) if key else None
+            if not mapped:
+                continue
+            raw_value = _parse_stat_value(s.get("displayValue", s.get("value")))
+            try:
+                stat_map[mapped] = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+        if not stat_map:
+            return FetchResult.fail(f"no recognizable stats in boxscore for event {event_id}")
+        return FetchResult.ok(stat_map)
+    except (KeyError, TypeError, IndexError) as exc:
+        return FetchResult.fail(f"unexpected boxscore shape: {exc}")
+
+
+def _team_allowed_stat_avg(espn_team_abbr: str, prop_columns: tuple, n_games: int = 8) -> Optional[float]:
+    """Average of what espn_team_abbr allowed across its last n_games
+    completed games, summed across prop_columns (so combo props like
+    PRA work in one boxscore fetch per game rather than several)."""
+    sched_res = get_espn_team_schedule_parsed(espn_team_abbr)
+    if not sched_res.success:
+        return None
+    completed = [g for g in sched_res.data if g.get("completed") and g.get("event_id") and g.get("opponent_abbr")]
+    recent = completed[-n_games:]
+    totals = []
+    for g in recent:
+        stats_res = get_espn_boxscore_team_stats(g["event_id"], g["opponent_abbr"])
+        if not stats_res.success:
+            continue
+        values = [stats_res.data[c] for c in prop_columns if c in stats_res.data]
+        if len(values) == len(prop_columns):
+            totals.append(sum(values))
+    if not totals:
+        return None
+    return sum(totals) / len(totals)
+
+
+def get_espn_stat_allowed_ranks(prop_key: str, n_games: int = 8) -> FetchResult:
+    """League-wide rank of how much each team allows in the given prop's
+    stat category(ies), computed from each team's last n_games completed
+    boxscores. Rank 1 = allows the most (most favorable matchup for the
+    Over) -- the same convention the old position-based DvP rank used.
+    This is a team-level proxy, not position-specific: it can't tell you
+    "this team is soft on guards," only "this team gives up a lot of
+    rebounds overall." One request per team for the schedule plus up to
+    n_games boxscore requests per team, so this is slower than the other
+    auto-fetches (roughly 15 x (1 + n_games) requests for a full league
+    table) but each game's boxscore is cached indefinitely within the
+    session since a completed game's stats never change.
+    """
+    prop = config.PROP_TYPES_BY_KEY.get(prop_key)
+    if prop is None:
+        return FetchResult.fail(f"unknown prop_key '{prop_key}'")
+
+    teams_res = get_espn_teams()
+    if not teams_res.success:
+        return teams_res
+
+    rows = []
+    for t in teams_res.data:
+        abbr, team_name = t.get("abbreviation"), t.get("displayName")
+        if not abbr or not team_name:
+            continue
+        avg_allowed = _team_allowed_stat_avg(abbr, prop.columns, n_games=n_games)
+        if avg_allowed is not None:
+            rows.append({"team_name": team_name, "allowed_avg": avg_allowed})
+
+    if not rows:
+        return FetchResult.fail("no usable boxscore data found for any team")
+
+    by_allowed = sorted(rows, key=lambda r: -r["allowed_avg"])  # allows the most -> rank 1
+    ranks = {
+        r["team_name"]: {
+            "stat_allowed_rank": i + 1,
+            "stat_allowed_avg": r["allowed_avg"],
+            "source": "espn_boxscore_recent_games",
+        }
+        for i, r in enumerate(by_allowed)
+    }
+    return FetchResult.ok(ranks)
+
+
+def dump_espn_boxscore_shape(event_id) -> dict:
+    """Introspection helper for get_espn_boxscore_team_stats: returns the
+    raw boxscore payload's team/statistics structure so a parsing mismatch
+    can be fixed from real structure instead of a guess -- the same
+    approach that resolved the gamelog parser's shape issues.
+    """
+    res = _espn_endpoint(f"{ESPN_SITE_BASE}/summary", {"event": event_id}, cache_key=f"espn_boxscore_{event_id}")
+    if not res.success:
+        return {"error": res.message}
+    payload = res.data
+    if not isinstance(payload, dict):
+        return {"top_level_type": str(type(payload))}
+    summary = {"top_level_keys": sorted(payload.keys())}
+    boxscore = payload.get("boxscore") or {}
+    summary["boxscore_keys"] = sorted(boxscore.keys())
+    teams = boxscore.get("teams") or []
+    if teams:
+        summary["team_entry_keys"] = sorted(teams[0].keys())
+        stats = teams[0].get("statistics") or []
+        if stats:
+            summary["sample_statistic_entries"] = stats[:5]
+    return summary
+
+
 def get_espn_team_roster(espn_team_abbr: str) -> FetchResult:
     return _espn_endpoint(
         f"{ESPN_SITE_BASE}/teams/{espn_team_abbr}/roster", None,
@@ -854,7 +993,20 @@ def diagnostics(player_name: Optional[str] = None, player_team_name: Optional[st
         espn_abbr = _check("espn_resolve_team_abbr", lambda: resolve_espn_team_abbr(player_team_name))
         if espn_abbr:
             _check("espn_team_roster", lambda: get_espn_team_roster(espn_abbr))
-            _check("espn_team_schedule_parsed", lambda: get_espn_team_schedule_parsed(espn_abbr))
+            schedule = _check("espn_team_schedule_parsed", lambda: get_espn_team_schedule_parsed(espn_abbr))
+            if schedule:
+                completed = [g for g in schedule if g.get("completed") and g.get("event_id") and g.get("opponent_abbr")]
+                if completed:
+                    sample_game = completed[-1]
+                    boxscore_ok = _check(
+                        "espn_boxscore_team_stats (DvP replacement)",
+                        lambda: get_espn_boxscore_team_stats(sample_game["event_id"], sample_game["opponent_abbr"]),
+                    )
+                    if boxscore_ok is None:
+                        shape = dump_espn_boxscore_shape(sample_game["event_id"])
+                        report["espn_boxscore_shape_dump"] = {
+                            "ok": True, "elapsed_sec": 0.0, "detail": str(shape)[:4000],
+                        }
 
     _check("espn_team_ranks_fallback (standings/schedule-scores)", get_espn_team_ranks_fallback)
 

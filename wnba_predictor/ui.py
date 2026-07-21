@@ -82,7 +82,7 @@ class PredictorUI:
 
         self.w_pace_rank = widgets.FloatText(description="Opp Pace Rank", style=s, layout=lay)
         self.w_def_rank = widgets.FloatText(description="Opp Defense Rank", style=s, layout=lay)
-        self.w_dvp_rank = widgets.FloatText(description="DvP Rank", style=s, layout=lay)
+        self.w_dvp_rank = widgets.FloatText(description="DvP Rank (Opp Allowed)", style=s, layout=lay)
         self.w_h2h_hit = widgets.FloatText(description="H2H Hit Rate", style=s, layout=lay)
 
         self.w_manual_adj = widgets.FloatSlider(description="Manual Matchup Adj", min=-0.15, max=0.15,
@@ -275,8 +275,30 @@ class PredictorUI:
             source = entry.get("source")
             note = f" ({source}, not stats.wnba.com's real pace metric)" if used_fallback and source else ""
             print(f"  Opponent ranks loaded{note}: {entry}")
-            print("  DvP rank has no reliable single-endpoint source -- leaving as manual entry "
-                  "(use Opponent Defense Rank as a proxy, or fill in from your own research).")
+
+        prop_key = PROP_LABELS[self.w_prop_type.value]
+        print(f"  Computing Opp Stat Allowed Rank for {self.w_prop_type.value} "
+              "(team-level proxy, not position-specific -- this queries recent boxscores "
+              "for all 15 teams, so it's slower than the other fetches)...")
+        stat_ranks_res = data_sources.get_espn_stat_allowed_ranks(prop_key)
+        if not stat_ranks_res.success:
+            print(f"  Opp Stat Allowed Rank fetch failed: {stat_ranks_res.message}")
+            print("  Leaving DvP Rank as manual entry (use Opponent Defense Rank as a proxy).")
+            own_sched_res = data_sources.get_espn_team_schedule_parsed(
+                data_sources.resolve_espn_team_abbr(self.w_player_team.value).data or ""
+            )
+            if own_sched_res.success:
+                completed = [g for g in own_sched_res.data if g.get("completed") and g.get("event_id")]
+                if completed:
+                    shape = data_sources.dump_espn_boxscore_shape(completed[-1]["event_id"])
+                    print(f"  Raw boxscore shape for debugging (please share this): {str(shape)[:4000]}")
+        else:
+            stat_entry = matchup.team_stat_allowed_rank(stat_ranks_res.data, self.w_opponent_team.value)
+            if stat_entry.get("stat_allowed_rank") is not None:
+                self.w_dvp_rank.value = stat_entry["stat_allowed_rank"]
+                print(f"  Opp Stat Allowed Rank loaded: {stat_entry}")
+            else:
+                print(f"  Opponent not found in stat-allowed table: {stat_entry}")
 
         own_espn_res = data_sources.resolve_espn_team_abbr(self.w_player_team.value)
         opp_espn_res = data_sources.resolve_espn_team_abbr(self.w_opponent_team.value)
