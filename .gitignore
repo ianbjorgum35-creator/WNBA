@@ -4,3 +4,8 @@ __pycache__/
 data/cache/*.json
 wnba_repo/
 .ipynb_checkpoints/
+.venv/
+
+# Google Drive OAuth secrets -- never commit these
+credentials.json
+data/token.json

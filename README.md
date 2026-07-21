@@ -4,30 +4,46 @@ Compares a model-predicted probability of a player prop hitting against the
 sportsbook's implied probability from odds you enter, then learns from
 closing-line value (CLV) and actual outcomes to recalibrate itself over time.
 
-## Quick start (Google Colab)
+## Quick start (web app)
 
-1. Open `WNBA_Prop_Predictor.ipynb` in Colab:
-   `https://colab.research.google.com/github/ianbjorgum35-creator/WNBA/blob/claude/wnba-update/WNBA_Prop_Predictor.ipynb`
-   (once this branch is merged, use `main` instead in that URL, and update
-   the `BRANCH` variable in the notebook's clone cell to match).
-2. Runtime > Run all. The "Check that the live data sources are actually
-   reachable" cell runs a diagnostic against every data source and prints
-   which ones are working -- if `stats.wnba.com` and/or ESPN are blocked in
-   your environment, you'll see it here before you even open the form.
-3. Use the form: pick player team / opponent team / prop type from
-   dropdowns, type in the player's name, the line, the odds, the game total
-   and spread. Those (plus prop type/line/odds) are the only fields meant to
-   be manual -- everything else (stats, ranks, home/away, rest days) is
-   supposed to auto-fetch.
-4. Click **Auto-Fetch Data**, then **Run Prediction**. If some fields don't
-   populate, click **Run Diagnostics** to see exactly which data source
-   failed and why, then fill those specific fields in by hand.
-5. Click **Log This Prediction** to save it for the learning loop. After the
-   game, come back and record the actual result (and closing odds, if you
-   have them) so the model can learn from it.
+This is now a local web app -- a small FastAPI server plus a static
+mobile/desktop-friendly page -- instead of a Colab notebook. Everything
+below runs on your own machine.
 
-No local setup required -- the notebook installs its own dependencies and
-pulls this repo's `wnba_predictor` package.
+1. Install dependencies (Python 3.10+):
+   ```
+   pip install -r requirements.txt
+   ```
+2. Start the server:
+   ```
+   uvicorn wnba_predictor.webapp:app --host 0.0.0.0 --port 8000
+   ```
+3. Open it:
+   - **On the computer running it:** `http://localhost:8000`
+   - **On your phone** (same WiFi network): find the computer's LAN IP
+     (e.g. `ipconfig getifaddr en0` on Mac, `ipconfig` on Windows, `hostname
+     -I` on Linux) and open `http://<that-ip>:8000` in your phone's
+     browser. `--host 0.0.0.0` is what makes it reachable from other
+     devices on the network, not just `localhost`.
+4. Use the form: pick player team / opponent team / prop type, type in the
+   player's name, the line, the odds, the game total and spread. Those
+   (plus prop type/line/odds) are the only fields meant to be manual --
+   everything else (stats, ranks, home/away, rest days) is supposed to
+   auto-fetch.
+5. Tap **Auto-Fetch Data**, then **Run Prediction**. If some fields don't
+   populate, tap **Run Diagnostics** to see exactly which data source failed
+   and why, then fill those specific fields in by hand.
+6. Tap **Log This Prediction** to save it for the learning loop. After the
+   game, come back, open **Record Outcome for a Past Bet**, refresh the
+   pending list, tap the bet, enter the actual result (and closing odds if
+   you have them), and tap **Record Outcome**.
+7. Once you've logged ~20+ resolved bets, open **Model Learning** and tap
+   **Recalibrate Model**.
+
+The Colab notebook (`WNBA_Prop_Predictor.ipynb`) still works if you prefer
+it, but the web app is now the primary way to use this -- it's the same
+`wnba_predictor` package underneath, just served over HTTP with a
+responsive UI instead of ipywidgets.
 
 ## What it computes
 
@@ -73,12 +89,38 @@ available):
 All three require enough resolved history to be meaningful and fall back to
 sane defaults (identity calibration, the config priors) until then.
 
-## Persisting your history across Colab sessions
+## Persisting your history to Google Drive
 
-Colab's local disk doesn't survive a runtime recycle. In the notebook's
-Drive-mount cell, set `USE_DRIVE = True` to store `bet_log.csv` and
-`learned_weights.json` in your Google Drive instead, so the model keeps
-learning across sessions.
+The web app stores `data/bet_log.csv` and `data/learned_weights.json`
+locally by default. To keep them synced to the same `wnba_prop_predictor`
+Google Drive folder the Colab notebook used to write to -- so history
+survives across devices/reinstalls, not just across sessions on one
+machine -- set up Drive OAuth once:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create (or
+   pick) a project, enable the **Google Drive API**, then create an
+   **OAuth client ID** of type **Desktop app**.
+2. Download it and save it as `credentials.json` in the repo root (this
+   file is gitignored -- never commit it).
+3. Start the app and open the **Google Drive Sync** section, or just tap
+   **Auto-Fetch Data**/**Log This Prediction** once -- the first Drive call
+   opens a browser tab for a one-time Google consent screen. Since this is
+   your own unverified OAuth client, click **Advanced > Go to \[app
+   name\] (unsafe)** to proceed -- that warning is expected for a personal
+   script, not a sign anything is wrong.
+4. After that, a refresh token is cached to `data/token.json` (also
+   gitignored) so you won't be prompted again on that machine.
+
+Once configured, every logged prediction, recorded outcome, and
+recalibration automatically pushes `bet_log.csv` / `learned_weights.json`
+back up to the `wnba_prop_predictor` Drive folder. On startup, the app
+pulls down whatever's currently in that folder, so bets logged from your
+old Colab sessions (or from another device running this app) carry
+straight into the model's training data -- nothing needs to be migrated by
+hand.
+
+If you skip this setup, the app still works fine with local-only files;
+you'll just need to copy `data/bet_log.csv` between machines yourself.
 
 ## Data sources and their limits
 
@@ -162,10 +204,13 @@ wnba_predictor/
   matchup.py           Pace/defense ranks, opponent stat-allowed (DvP proxy) rank, H2H hit rate, rest/b2b, game environment
   projection.py         Blend + adjustment + distribution model -> predicted probability
   clv.py               Bet logging, outcome recording, calibration report, the learning loop
-  ui.py                 ipywidgets dropdown UI (includes a Run Diagnostics button)
-WNBA_Prop_Predictor.ipynb   Self-contained Colab notebook (diagnostics cell runs before the UI)
+  drive_sync.py          Optional Google Drive OAuth sync for bet_log.csv / learned_weights.json
+  webapp.py               FastAPI backend for the web app (stateless REST API over the modules above)
+  ui.py                    ipywidgets dropdown UI, used only by the legacy Colab notebook
+static/                        Mobile/desktop-friendly frontend (index.html, app.js, styles.css) served by webapp.py
+WNBA_Prop_Predictor.ipynb   Legacy Colab notebook (still works, no longer the primary way to use this)
 tests/                        Synthetic-data + mocked-response sanity tests (no live network required)
-data/bet_log.csv              Seed CLV/outcome log (headers only)
+data/bet_log.csv              CLV/outcome log (carried over from the wnba_prop_predictor Drive folder)
 ```
 
 ## Running tests locally
