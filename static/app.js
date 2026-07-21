@@ -6,6 +6,10 @@ let selectedPendingId = null;
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    window.location.href = "/login";
+    throw new Error("session expired, redirecting to login");
+  }
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${text}`);

@@ -44,6 +44,15 @@ def is_configured() -> bool:
     return os.path.exists(CREDENTIALS_PATH)
 
 
+# Deploy platforms that inject secrets as read-only mounted files (e.g.
+# Render's "Secret Files", mounted under /etc/secrets/) can't have their
+# TOKEN_PATH rewritten in place after a refresh. Fall back to a writable
+# cache alongside the bet log -- ephemeral disk is fine here since a
+# refresh_token stays valid regardless of where the *access* token that
+# results from using it gets cached.
+_WRITABLE_TOKEN_CACHE = os.path.join(config.DATA_DIR, "_token_cache.json")
+
+
 def get_service():
     """Returns an authenticated Drive API client, or raises if credentials.json
     is missing / the OAuth flow fails. Callers should catch and fail soft."""
@@ -52,9 +61,13 @@ def get_service():
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
+    # Prefer the writable cache if we've already refreshed once (it may be
+    # newer than the original TOKEN_PATH, which could be a read-only mount).
+    read_path = _WRITABLE_TOKEN_CACHE if os.path.exists(_WRITABLE_TOKEN_CACHE) else TOKEN_PATH
+
     creds = None
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if os.path.exists(read_path):
+        creds = Credentials.from_authorized_user_file(read_path, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -68,9 +81,16 @@ def get_service():
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        os.makedirs(os.path.dirname(TOKEN_PATH) or ".", exist_ok=True)
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
+        # Try the configured path first (works for normal local files);
+        # if that's read-only (a mounted secret), fall back to the cache.
+        for target in [TOKEN_PATH, _WRITABLE_TOKEN_CACHE]:
+            try:
+                os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+                with open(target, "w") as f:
+                    f.write(creds.to_json())
+                break
+            except OSError:
+                continue
 
     return build("drive", "v3", credentials=creds)
 
@@ -176,5 +196,5 @@ def sync_up(bet_log_path: str = config.BET_LOG_PATH,
 def status() -> dict:
     if not is_configured():
         return _status(False, False, "not configured (no credentials.json)")
-    connected = os.path.exists(TOKEN_PATH)
+    connected = os.path.exists(TOKEN_PATH) or os.path.exists(_WRITABLE_TOKEN_CACHE)
     return _status(True, connected, "configured" + (", authorized" if connected else ", not yet authorized"))

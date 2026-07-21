@@ -8,6 +8,7 @@ pytest>=7.4
 # Web app (local FastAPI server + static frontend, replaces Colab/ipywidgets)
 fastapi>=0.110
 uvicorn>=0.29
+python-multipart>=0.0.9   # needed for the /login form (fastapi.Form)
 
 # Google Drive sync (optional -- only needed if you want bet_log.csv /
 # learned_weights.json to persist to Drive across devices)

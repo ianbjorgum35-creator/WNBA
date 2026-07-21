@@ -4,11 +4,14 @@ Compares a model-predicted probability of a player prop hitting against the
 sportsbook's implied probability from odds you enter, then learns from
 closing-line value (CLV) and actual outcomes to recalibrate itself over time.
 
-## Quick start (web app)
+## Quick start (running locally)
 
-This is now a local web app -- a small FastAPI server plus a static
-mobile/desktop-friendly page -- instead of a Colab notebook. Everything
-below runs on your own machine.
+This is now a web app -- a small FastAPI server plus a static
+mobile/desktop-friendly page -- instead of a Colab notebook. Running it
+this way only works while your computer is on and reachable, and only from
+other devices on the same WiFi network. If you want it reachable from
+anywhere (work WiFi, mobile data, etc.), skip to **Deploy to Render**
+below instead -- it's the same app either way.
 
 1. Install dependencies (Python 3.10+):
    ```
@@ -40,10 +43,62 @@ below runs on your own machine.
 7. Once you've logged ~20+ resolved bets, open **Model Learning** and tap
    **Recalibrate Model**.
 
+Locally the app runs with no login by default. If you set `APP_PASSWORD`
+while testing locally (to try the login flow before deploying), the
+session cookie is HTTPS-only by default -- add `WNBA_INSECURE_COOKIE=1` as
+well so it still works over plain `http://localhost`.
+
 The Colab notebook (`WNBA_Prop_Predictor.ipynb`) still works if you prefer
 it, but the web app is now the primary way to use this -- it's the same
 `wnba_predictor` package underneath, just served over HTTP with a
 responsive UI instead of ipywidgets.
+
+## Deploy to Render (access from anywhere, not just home WiFi)
+
+This gets you a `https://something.onrender.com` URL reachable from work
+WiFi, mobile data, anywhere -- at the cost of the free tier spinning the
+service down after 15 minutes idle (the next request after that takes
+~30-50s to wake it back up).
+
+1. Push this repo to GitHub (already done if you're reading this from the
+   repo).
+2. In the [Render dashboard](https://dashboard.render.com/), **New >
+   Blueprint**, connect this GitHub repo. Render reads `render.yaml` at
+   the repo root and sets up the web service automatically.
+3. Render will prompt for the env vars marked `sync: false` in
+   `render.yaml`:
+   - **`APP_PASSWORD`** (required) -- the app is reachable by anyone with
+     the URL once deployed, so this puts a login screen in front of it.
+     Pick anything; you'll type it once per device/browser (the session is
+     remembered for 30 days).
+   - `WNBA_DRIVE_CREDENTIALS` / `WNBA_DRIVE_TOKEN` -- only if you're using
+     Drive sync (see below); leave blank otherwise.
+4. Deploy. Once it's up, open the Render URL, enter the password, and use
+   it exactly like the local version.
+
+**Persistence on Render's free tier matters more than it does locally**:
+the free tier has no persistent disk, so every time the service spins back
+up from idle it starts from a fresh copy of whatever's in the git repo --
+`data/bet_log.csv` reverts to what's committed, losing anything logged
+since. **Set up Google Drive sync (below) if you deploy this**, so logged
+predictions and recorded outcomes survive restarts; without it, treat the
+deployed copy as a client for occasional access rather than where you
+build up bet history.
+
+To make Drive sync work on Render specifically (it can't pop open a
+browser for the OAuth consent screen the way it does locally):
+1. Do the one-time OAuth consent **locally first** (run the app locally,
+   trigger a Drive pull/push once -- see the section below). This
+   produces `data/token.json` on your machine.
+2. In the Render dashboard, under your service's **Environment > Secret
+   Files**, add two files: `credentials.json` and `token.json`, pasting in
+   the contents of your local copies. Render mounts these read-only at
+   `/etc/secrets/credentials.json` and `/etc/secrets/token.json`.
+3. Set the env vars `WNBA_DRIVE_CREDENTIALS=/etc/secrets/credentials.json`
+   and `WNBA_DRIVE_TOKEN=/etc/secrets/token.json` (from step 3 above).
+4. Redeploy. The app reads its refresh token from that mounted file; since
+   the mount is read-only, refreshed access tokens get cached to local
+   ephemeral disk instead (handled automatically) rather than failing.
 
 ## What it computes
 
@@ -208,6 +263,7 @@ wnba_predictor/
   webapp.py               FastAPI backend for the web app (stateless REST API over the modules above)
   ui.py                    ipywidgets dropdown UI, used only by the legacy Colab notebook
 static/                        Mobile/desktop-friendly frontend (index.html, app.js, styles.css) served by webapp.py
+render.yaml                     Render Blueprint for deploying the web app publicly (see "Deploy to Render")
 WNBA_Prop_Predictor.ipynb   Legacy Colab notebook (still works, no longer the primary way to use this)
 tests/                        Synthetic-data + mocked-response sanity tests (no live network required)
 data/bet_log.csv              CLV/outcome log (carried over from the wnba_prop_predictor Drive folder)

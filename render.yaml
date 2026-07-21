@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: wnba-prop-predictor
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn wnba_predictor.webapp:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: APP_PASSWORD
+        sync: false
+      # Only needed if you've set up Drive sync (see README) -- point these
+      # at Render "Secret Files" you upload in the dashboard, e.g.
+      # /etc/secrets/credentials.json and /etc/secrets/token.json.
+      - key: WNBA_DRIVE_CREDENTIALS
+        sync: false
+      - key: WNBA_DRIVE_TOKEN
+        sync: false

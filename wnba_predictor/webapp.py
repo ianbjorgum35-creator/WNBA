@@ -10,12 +10,14 @@ prediction, you just type the number in.
 Run with:  uvicorn wnba_predictor.webapp:app --host 0.0.0.0 --port 8000
 """
 
+import hashlib
+import hmac
 import os
 import traceback
 from typing import Optional
 
-from fastapi import Body, FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, Form, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import clv, config, data_sources, drive_sync, matchup, projection, stats_engine
@@ -37,6 +39,98 @@ def _startup():
         drive_sync.sync_down(BET_LOG_PATH, WEIGHTS_PATH)
     except Exception:
         pass  # best-effort; local files are still usable
+
+
+# ----------------------------------------------------------------------
+# Password gate (single shared password -- this is a personal tool, not a
+# multi-user app). Unset APP_PASSWORD to run with no auth (e.g. local dev).
+# The session cookie is a fixed HMAC of the password itself, so it survives
+# server restarts without needing a separately-managed secret, and a wrong
+# guess can't forge it without knowing APP_PASSWORD.
+# ----------------------------------------------------------------------
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+SESSION_COOKIE = "wnba_session"
+# Cookie defaults to HTTPS-only (correct on Render, which terminates TLS at
+# its proxy). Set WNBA_INSECURE_COOKIE=1 only for local http:// testing.
+_COOKIE_SECURE = os.environ.get("WNBA_INSECURE_COOKIE") != "1"
+
+LOGIN_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WNBA Prop Predictor -- Sign in</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          background: #f5f6f8; display: flex; align-items: center; justify-content: center;
+          height: 100vh; margin: 0; }}
+  form {{ background: #fff; border: 1px solid #dcdfe4; border-radius: 10px; padding: 1.5rem;
+          width: 260px; }}
+  h1 {{ font-size: 1.1rem; margin: 0 0 1rem; }}
+  input {{ width: 100%; padding: 0.55rem; border-radius: 8px; border: 1px solid #dcdfe4;
+           box-sizing: border-box; font-size: 1rem; }}
+  button {{ width: 100%; margin-top: 0.8rem; padding: 0.6rem; border-radius: 8px; border: none;
+            background: #2563eb; color: #fff; font-size: 1rem; }}
+  p.error {{ color: #c0362c; font-size: 0.85rem; margin: 0.5rem 0 0; }}
+</style></head>
+<body>
+<form method="post" action="/login">
+  <h1>WNBA Prop Predictor</h1>
+  <input type="password" name="password" placeholder="Password" autofocus required>
+  {error_html}
+  <button type="submit">Sign in</button>
+</form>
+</body></html>"""
+
+
+def _expected_session_token() -> str:
+    return hmac.new(APP_PASSWORD.encode(), b"wnba-session-v1", hashlib.sha256).hexdigest()
+
+
+def _authenticated(request: Request) -> bool:
+    if not APP_PASSWORD:
+        return True
+    cookie = request.cookies.get(SESSION_COOKIE, "")
+    return hmac.compare_digest(cookie, _expected_session_token())
+
+
+@app.middleware("http")
+async def password_gate(request: Request, call_next):
+    if not APP_PASSWORD or request.url.path in ("/login", "/favicon.ico"):
+        return await call_next(request)
+    if _authenticated(request):
+        return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return RedirectResponse(url="/login")
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_form(error: Optional[str] = None):
+    error_html = '<p class="error">Wrong password.</p>' if error else ""
+    return LOGIN_PAGE.format(error_html=error_html)
+
+
+@app.post("/login")
+def login_submit(password: str = Form(...)):
+    if APP_PASSWORD and hmac.compare_digest(password, APP_PASSWORD):
+        resp = RedirectResponse(url="/", status_code=303)
+        resp.set_cookie(
+            SESSION_COOKIE, _expected_session_token(),
+            httponly=True, samesite="lax", secure=_COOKIE_SECURE, max_age=60 * 60 * 24 * 30,
+        )
+        return resp
+    return RedirectResponse(url="/login?error=1", status_code=303)
+
+
+@app.get("/logout")
+def logout():
+    resp = RedirectResponse(url="/login")
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return HTMLResponse(status_code=204, content="")
 
 
 # ----------------------------------------------------------------------
