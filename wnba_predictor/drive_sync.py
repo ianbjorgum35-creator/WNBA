@@ -9,16 +9,21 @@ credentials.json) or is temporarily unreachable.
 
 Setup (one-time, done by the user -- see README):
   1. Google Cloud Console -> new/existing project -> enable the Google Drive
-     API -> OAuth client ID (type "Desktop app") -> download as
-     credentials.json into the repo root.
-  2. First run that touches Drive opens a browser for a one-time consent
-     screen; the refresh token is cached to data/token.json (gitignored) so
-     later runs don't prompt again.
+     API -> OAuth client ID -> download as credentials.json into the repo
+     root.
+  2. Authorize once (scripts/get_drive_token.py, or Google's device-code
+     flow for a terminal-free setup); the refresh token is cached to
+     data/token.json (gitignored) so later runs don't prompt again.
 
-Scope is the full `drive` scope (not the narrower `drive.file`) because the
-existing wnba_prop_predictor folder and its bet_log.csv were created outside
-this app (by the Colab notebook), and `drive.file` can only see files the
-app itself created or that were explicitly picked via the Google Picker UI.
+Scope is the narrower `drive.file`, not the broader `drive` scope: it's
+what Google's device-code flow (no local browser/redirect needed) actually
+allows, and it's least-privilege besides -- the app can only see files and
+folders it creates itself. Practical effect: the app creates its own
+wnba_prop_predictor folder on first sync rather than reusing a
+pre-existing folder of that name from another tool (e.g. an older Colab
+notebook using its own Drive mount) -- drive.file has no way to discover a
+folder it didn't create. If migrating history from such a folder, seed
+data/bet_log.csv from it manually first; sync from then on is automatic.
 """
 
 import io
@@ -27,7 +32,7 @@ from typing import Optional
 
 from . import config
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 DRIVE_FOLDER_NAME = "wnba_prop_predictor"
 
 CREDENTIALS_PATH = os.environ.get("WNBA_DRIVE_CREDENTIALS", "credentials.json")

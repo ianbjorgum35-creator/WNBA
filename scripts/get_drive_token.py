@@ -20,7 +20,7 @@ import sys
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 CREDENTIALS_PATH = os.environ.get("WNBA_DRIVE_CREDENTIALS", "credentials.json")
 TOKEN_PATH = os.environ.get("WNBA_DRIVE_TOKEN", os.path.join("data", "token.json"))
 
