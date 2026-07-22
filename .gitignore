@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+data/cache/*.json
+wnba_repo/
+.ipynb_checkpoints/
