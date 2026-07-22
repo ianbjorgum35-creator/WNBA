@@ -87,9 +87,19 @@ build up bet history.
 
 To make Drive sync work on Render specifically (it can't pop open a
 browser for the OAuth consent screen the way it does locally):
-1. Do the one-time OAuth consent **locally first** (run the app locally,
-   trigger a Drive pull/push once -- see the section below). This
-   produces `data/token.json` on your machine.
+1. Do the one-time OAuth consent **locally first**, using
+   `scripts/get_drive_token.py` -- it's a small standalone script, so you
+   don't need to install this whole project or run the full app just to
+   generate a token:
+   ```
+   pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
+   python scripts/get_drive_token.py
+   ```
+   Run it from a folder with your downloaded `credentials.json` in it (the
+   repo root works, or anywhere). It opens a browser for a one-time Google
+   consent screen (click **Advanced > Go to \[app name\] (unsafe)** when
+   you hit the unverified-app warning -- expected for your own personal
+   OAuth client) and writes `data/token.json`.
 2. In the Render dashboard, under your service's **Environment > Secret
    Files**, add two files: `credentials.json` and `token.json`, pasting in
    the contents of your local copies. Render mounts these read-only at
@@ -264,6 +274,7 @@ wnba_predictor/
   ui.py                    ipywidgets dropdown UI, used only by the legacy Colab notebook
 static/                        Mobile/desktop-friendly frontend (index.html, app.js, styles.css) served by webapp.py
 render.yaml                     Render Blueprint for deploying the web app publicly (see "Deploy to Render")
+scripts/get_drive_token.py       Standalone one-time script that generates data/token.json for Drive sync
 WNBA_Prop_Predictor.ipynb   Legacy Colab notebook (still works, no longer the primary way to use this)
 tests/                        Synthetic-data + mocked-response sanity tests (no live network required)
 data/bet_log.csv              CLV/outcome log (carried over from the wnba_prop_predictor Drive folder)
